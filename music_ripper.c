@@ -62,7 +62,10 @@ int music_ripper_play_next(const MusicRipper *ripper, const LibrarySongQuery *so
         break;
     case LIBRARY_SOURCE_HTTPS:
         if (!ripper->transports.https) { set_error(error, error_size, "HTTPS transport is not configured"); result = -1; }
-        else result = ripper->transports.https(source, write, write_userdata, ripper->transports.userdata);
+        else {
+            result = ripper->transports.https(source, write, write_userdata, ripper->transports.userdata);
+            if (result) set_error(error, error_size, "HTTPS transfer failed");
+        }
         break;
     case LIBRARY_SOURCE_NETWORK:
         if (!ripper->transports.network) { set_error(error, error_size, "network transport is not configured"); result = -1; }

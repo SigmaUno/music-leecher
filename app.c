@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -195,6 +196,39 @@ static int stream_ssh(const LibrarySource *source, MusicRipperWriteFn write,
     return result;
 }
 
+static int stream_https(const LibrarySource *source, MusicRipperWriteFn write,
+                        void *write_userdata, void *transport_userdata) {
+    unsigned char buffer[64 * 1024];
+    int pipe_fds[2], status;
+    pid_t pid;
+    ssize_t bytes;
+    int result = 0;
+    (void)transport_userdata;
+    if (!source || !source->url || strncasecmp(source->url, "https://", 8) != 0) return -1;
+    if (pipe(pipe_fds) != 0) return -1;
+    pid = fork();
+    if (pid == 0) {
+        char *const arguments[] = { "curl", "--fail", "--location", "--max-redirs", "5",
+            "--proto", "=https", "--tlsv1.2", "--connect-timeout", "15", "--max-time", "300",
+            "--silent", "--show-error", "--output", "-", "--", source->url, NULL };
+        close(pipe_fds[0]);
+        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) _exit(127);
+        close(pipe_fds[1]);
+        execvp(arguments[0], arguments);
+        _exit(127);
+    }
+    close(pipe_fds[1]);
+    if (pid < 0) { close(pipe_fds[0]); return -1; }
+    while ((bytes = read(pipe_fds[0], buffer, sizeof(buffer))) > 0) {
+        if (!write(buffer, (size_t)bytes, write_userdata)) { result = -1; break; }
+    }
+    if (bytes < 0 && errno != EINTR) result = -1;
+    close(pipe_fds[0]);
+    if (result) kill(pid, SIGTERM);
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) result = -1;
+    return result;
+}
+
 static void choose_local_file(AppState *state) {
     char path[sizeof(state->path)] = {0};
     FILE *picker = popen("zenity --file-selection --title='Choose music file'", "r");
@@ -328,6 +362,7 @@ int main(int argc, char **argv) {
     if (!library) { fprintf(stderr, "Cannot load %s: %s\n", library_path, error); return 1; }
     ripper.library = library;
     ripper.transports.ssh = stream_ssh;
+    ripper.transports.https = stream_https;
     assembler = assembler_create(NULL);
     if (!assembler) { fprintf(stderr, "Cannot create assembler queue\n"); library_handler_close(library); return 1; }
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); assembler_destroy(assembler); library_handler_close(library); return 1; }
