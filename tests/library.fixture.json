@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "tracks": [
+    {
+      "id": "mbid:8c98e68d-920a-46c1-b676-eba7a0255cf5",
+      "title": "Teardrop",
+      "artist": "Massive Attack",
+      "album": "Mezzanine",
+      "duration_ms": 330000,
+      "sources": [
+        { "kind": "local", "PATH": "/music/teardrop.flac", "USERNAME": null, "URL": null, "IP": null },
+        { "kind": "https", "PATH": null, "USERNAME": null, "URL": "https://media.example.invalid/teardrop.flac", "IP": null },
+        { "kind": "ssh", "PATH": "/srv/music/teardrop.flac", "USERNAME": "music", "URL": null, "IP": "192.0.2.10" },
+        { "kind": "network", "PATH": "/share/music/teardrop.flac", "USERNAME": "guest", "URL": null, "IP": "192.0.2.20" }
+      ]
+    }
+  ]
+}

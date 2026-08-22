@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "tracks": [
+    {
+      "id": "mbid:8c98e68d-920a-46c1-b676-eba7a0255cf5",
+      "title": "Teardrop",
+      "artist": "Massive Attack",
+      "album": "Mezzanine",
+      "duration_ms": 330000,
+      "sources": [
+        {
+          "kind": "local",
+          "PATH": "/music/Massive Attack/Mezzanine/01 Teardrop.flac",
+          "USERNAME": null,
+          "URL": null,
+          "IP": null
+        },
+        {
+          "kind": "ssh",
+          "PATH": "/srv/music/Massive Attack/Mezzanine/01 Teardrop.flac",
+          "USERNAME": "music",
+          "URL": null,
+          "IP": "192.0.2.10"
+        },
+        {
+          "kind": "https",
+          "PATH": null,
+          "USERNAME": null,
+          "URL": "https://media.example.invalid/teardrop.flac",
+          "IP": null
+        },
+        {
+          "kind": "network",
+          "PATH": "/share/music/Massive Attack/Mezzanine/01 Teardrop.flac",
+          "USERNAME": "guest",
+          "URL": null,
+          "IP": "192.0.2.20"
+        }
+      ]
+    }
+  ,{"title":"Airbag","artist":"Radiohead","album":"Going to America","sources":[{"kind":"local","PATH":"/home/kevin/Videos/01_-_Radiohead_-_Airbag [01_-_Radiohead_-_Airbag].mp3","USERNAME":null,"URL":null,"IP":null},{"kind":"local","PATH":"/home/kevin/Music/Radiohead - OK Computer - Track (01).mp3","USERNAME":null,"URL":null,"IP":null},{"kind":"local","PATH":"/home/kevin/Music/Radiohead - OK Computer - Track (01).mp3","USERNAME":null,"URL":null,"IP":null}]},{"title":"Enter Sandman","artist":"Metallica","album":"Metallica","sources":[{"kind":"local","PATH":"/home/kevin/Videos/01 Metallica - Enter Sandman.mp3","USERNAME":null,"URL":null,"IP":null}]},{"title":"Airbag","artist":"Radiohead","album":"OK COMPUTER","sources":[{"kind":"local","PATH":"/home/kevin/Music/Radiohead - OK Computer - Track (01).mp3","USERNAME":null,"URL":null,"IP":null}]},{"title":"If You Say The Word","artist":"Radiohead","album":"Kid Amnesia","sources":[{"kind":"ssh","PATH":"/home/sysrex/Music/ROCK/If You Say The Word.flac","USERNAME":"sysrex","URL":null,"IP":"100.67.13.80"},{"kind":"ssh","PATH":"/home/sysrex/Music/ROCK/'If You Say The Word.flac'","USERNAME":"sysrex","URL":null,"IP":"100.67.13.80"},{"kind":"ssh","PATH":"/home/sysrex/Music/ROCK/'If You Say The Word.flac'","USERNAME":"sysrex","URL":null,"IP":"100.67.13.80"},{"kind":"ssh","PATH":"/home/sysrex/Music/ROCK/'If You Say The Word.flac'","USERNAME":"sysrex","URL":null,"IP":"100.67.13.80"}]}]
+}
