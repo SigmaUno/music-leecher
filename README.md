@@ -1,2 +1,2 @@
 # music-leecher
-leeches music off of local files, local netowkrs, SSH agents, or online
+leeches music off of local files, local netwokrs, SSH agents, or online
