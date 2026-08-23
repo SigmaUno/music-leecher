@@ -5,8 +5,8 @@ CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
 
 all: library-handler
 
-app: app.c library_handler.c library_handler.h music_ripper.c music_ripper.h assembler.c assembler.h decoder.c decoder.h third_party/nuklear/nuklear.h third_party/nuklear/nuklear_sdl_renderer.h
-	$(CC) $(CFLAGS) -I. app.c library_handler.c music_ripper.c assembler.c decoder.c $$(pkg-config --cflags --libs sdl2 sndfile) -lm -o $@
+app: app.c library_handler.c library_handler.h music_ripper.c music_ripper.h assembler.c assembler.h decoder.c decoder.h metadata.c metadata.h third_party/nuklear/nuklear.h third_party/nuklear/nuklear_sdl_renderer.h
+	$(CC) $(CFLAGS) -I. app.c library_handler.c music_ripper.c assembler.c decoder.c metadata.c $$(pkg-config --cflags --libs sdl2 sndfile) -lm -o $@
 
 library-handler: library_handler.c
 	$(CC) $(CFLAGS) -DLIBRARY_HANDLER_STANDALONE $< -o $@
@@ -35,12 +35,16 @@ test-assembler: tests/test_assembler.c assembler.c assembler.h
 test-decoder: tests/test_decoder.c decoder.c decoder.h assembler.c assembler.h
 	$(CC) $(CFLAGS) -I. tests/test_decoder.c decoder.c assembler.c $$(pkg-config --cflags --libs sndfile) -o $@
 
-test: library-handler test-music-ripper test-library-mutation test-assembler test-decoder
+test-metadata: tests/test_metadata.c metadata.c metadata.h
+	$(CC) $(CFLAGS) -I. tests/test_metadata.c metadata.c -o $@
+
+test: library-handler test-music-ripper test-library-mutation test-assembler test-decoder test-metadata
 	./tests/test_library_handler.sh
 	./test-music-ripper
 	./tests/test_library_mutation.sh
 	./test-assembler
 	./test-decoder
+	./test-metadata
 
 clean:
-	rm -f app library-handler library-handler.o music-ripper.o assembler.o decoder.o test-music-ripper test-library-mutation test-assembler test-decoder
+	rm -f app library-handler library-handler.o music-ripper.o assembler.o decoder.o test-music-ripper test-library-mutation test-assembler test-decoder test-metadata

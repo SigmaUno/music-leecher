@@ -12,6 +12,7 @@
 #include "music_ripper.h"
 #include "assembler.h"
 #include "decoder.h"
+#include "metadata.h"
 #include "third_party/nuklear/nuklear.h"
 #include "third_party/nuklear/nuklear_sdl_renderer.h"
 
@@ -26,6 +27,7 @@
 #include <strings.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef enum { SOURCE_LOCAL, SOURCE_SSH, SOURCE_HTTPS, SOURCE_NETWORK } SourceMethod;
@@ -234,12 +236,185 @@ static void choose_local_file(AppState *state) {
     FILE *picker = popen("zenity --file-selection --title='Choose music file'", "r");
     if (!picker) { snprintf(state->status, sizeof(state->status), "Could not open the system file picker."); return; }
     if (fgets(path, sizeof(path), picker)) {
+        AudioMetadata metadata = {0};
+        char error[256] = {0};
+        
         path[strcspn(path, "\r\n")] = '\0';
         snprintf(state->path, sizeof(state->path), "%s", path);
-        snprintf(state->status, sizeof(state->status), "Selected local file: %.220s", state->path);
+        
+        /* Try to extract metadata from the file */
+        if (metadata_extract_from_file(path, &metadata, error, sizeof(error)) == 1) {
+            if (metadata.title) snprintf(state->title, sizeof(state->title), "%s", metadata.title);
+            if (metadata.artist) snprintf(state->artist, sizeof(state->artist), "%s", metadata.artist);
+            if (metadata.album) snprintf(state->album, sizeof(state->album), "%s", metadata.album);
+            snprintf(state->status, sizeof(state->status), "Selected: %.150s (metadata extracted)", path);
+            metadata_destroy(&metadata);
+        } else {
+            snprintf(state->status, sizeof(state->status), "Selected local file: %.220s", path);
+        }
     }
     pclose(picker);
 }
+
+static void extract_ssh_metadata(AppState *state) {
+    AudioMetadata metadata = {0};
+    char error[256] = {0};
+    int result;
+
+    if (!state->username[0] || !state->ip[0] || !state->path[0]) {
+        snprintf(state->status, sizeof(state->status), "Enter USERNAME, IP, and PATH to extract metadata.");
+        return;
+    }
+
+    result = metadata_extract_from_ssh(state->username, state->ip, state->path, &metadata, error, sizeof(error));
+    
+    if (result == 1) {
+        if (metadata.title) snprintf(state->title, sizeof(state->title), "%s", metadata.title);
+        if (metadata.artist) snprintf(state->artist, sizeof(state->artist), "%s", metadata.artist);
+        if (metadata.album) snprintf(state->album, sizeof(state->album), "%s", metadata.album);
+        snprintf(state->status, sizeof(state->status), "Remote metadata extracted from %.150s", state->path);
+        metadata_destroy(&metadata);
+    } else if (result == 0) {
+        snprintf(state->status, sizeof(state->status), "Remote file not found: %.220s", state->path);
+    } else {
+        snprintf(state->status, sizeof(state->status), "Metadata error: %s", error);
+    }
+}
+
+static void choose_ssh_file(AppState *state) {
+    char path[sizeof(state->path)] = {0};
+    char command[2048];
+    char temp_file[256];
+    FILE *temp, *picker;
+    AudioMetadata metadata = {0};
+    char error[256] = {0};
+    char line[512];
+    int file_count = 0;
+
+    if (!state->username[0] || !state->ip[0]) {
+        snprintf(state->status, sizeof(state->status), "Enter USERNAME and IP first.");
+        return;
+    }
+
+    /* Create temp file for file list output */
+    snprintf(temp_file, sizeof(temp_file), "/tmp/music_files_%ld.txt", (long)time(NULL));
+
+    /* If PATH is already entered, search only in that directory */
+    if (state->path[0]) {
+        /* Search in the specified directory */
+        if (snprintf(command, sizeof(command),
+            "ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
+            "'find \"%s\" -maxdepth 1 -type f \\( -iname \"*.mp3\" -o -iname \"*.flac\" -o -iname \"*.ogg\" -o -iname \"*.wav\" -o -iname \"*.m4a\" \\) 2>/dev/null | sort' > %s 2>&1",
+            state->username, state->ip, state->path, temp_file) >= (int)sizeof(command)) {
+            snprintf(state->status, sizeof(state->status), "SSH command too long.");
+            return;
+        }
+    } else {
+        /* No PATH specified - search from home with fallbacks */
+        if (snprintf(command, sizeof(command),
+            "(ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
+            "'find ~/ -type f \\( -iname \"*.mp3\" -o -iname \"*.flac\" -o -iname \"*.ogg\" -o -iname \"*.wav\" -o -iname \"*.m4a\" \\) 2>/dev/null' || "
+            "ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
+            "'find ~/Music -type f 2>/dev/null' || "
+            "ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
+            "'ls -1 ~/Music/*.mp3 ~/Music/*.flac ~/Music/*.ogg 2>/dev/null') 2>&1 | sort > %s",
+            state->username, state->ip,
+            state->username, state->ip,
+            state->username, state->ip,
+            temp_file) >= (int)sizeof(command)) {
+            snprintf(state->status, sizeof(state->status), "SSH command too long.");
+            return;
+        }
+    }
+
+    /* Execute the command and wait for completion */
+    system(command);
+
+    /* Read results from temp file */
+    temp = fopen(temp_file, "r");
+    if (!temp) {
+        snprintf(state->status, sizeof(state->status), "Could not create file list (SSH may have failed).");
+        return;
+    }
+
+    /* Count non-empty lines */
+    file_count = 0;
+    while (fgets(line, sizeof(line), temp)) {
+        if (line[0] && line[0] != ' ' && line[0] != '\n') {
+            file_count++;
+        }
+    }
+    rewind(temp);
+
+    if (file_count == 0) {
+        fclose(temp);
+        unlink(temp_file);
+        if (state->path[0]) {
+            snprintf(state->status, sizeof(state->status), "No music files in: %.180s", state->path);
+        } else {
+            snprintf(state->status, sizeof(state->status), 
+                "No music files found. Check SSH access, music location, or file permissions.");
+        }
+        return;
+    }
+
+    /* Build zenity command - use file directly, not pipe */
+    char zenity_cmd[2048];
+    if (state->path[0]) {
+        snprintf(zenity_cmd, sizeof(zenity_cmd), 
+            "zenity --list --title='Music files in %s (%d files)' --column='File' --width=750 --height=550 < %s",
+            state->path, file_count, temp_file);
+    } else {
+        snprintf(zenity_cmd, sizeof(zenity_cmd), 
+            "zenity --list --title='Choose remote music file (%d files)' --column='File' --width=750 --height=550 < %s",
+            file_count, temp_file);
+    }
+
+    picker = popen(zenity_cmd, "r");
+    if (!picker) {
+        fclose(temp);
+        unlink(temp_file);
+        snprintf(state->status, sizeof(state->status), "Could not open file picker dialog.");
+        return;
+    }
+
+    if (fgets(path, sizeof(path), picker)) {
+        int status = pclose(picker);
+        
+        /* Check if user actually selected something (zenity returns 0 on success) */
+        if (status == 0 && path[0]) {
+            path[strcspn(path, "\r\n")] = '\0';
+            
+            if (path[0]) {
+                snprintf(state->path, sizeof(state->path), "%s", path);
+
+                /* Try to extract metadata from the remote file */
+                if (metadata_extract_from_ssh(state->username, state->ip, path, &metadata, error, sizeof(error)) == 1) {
+                    if (metadata.title) snprintf(state->title, sizeof(state->title), "%s", metadata.title);
+                    if (metadata.artist) snprintf(state->artist, sizeof(state->artist), "%s", metadata.artist);
+                    if (metadata.album) snprintf(state->album, sizeof(state->album), "%s", metadata.album);
+                    snprintf(state->status, sizeof(state->status), "Selected: %.100s (metadata extracted)", path);
+                    metadata_destroy(&metadata);
+                } else {
+                    snprintf(state->status, sizeof(state->status), "Selected: %.150s (metadata unavailable on remote)", path);
+                }
+            } else {
+                snprintf(state->status, sizeof(state->status), "No file selected.");
+            }
+        } else {
+            snprintf(state->status, sizeof(state->status), "No file selected.");
+        }
+    } else {
+        pclose(picker);
+        snprintf(state->status, sizeof(state->status), "File picker was cancelled or failed.");
+    }
+
+    fclose(temp);
+    unlink(temp_file);
+}
+
+
+
 
 static void play_assembled_audio(Assembler *assembler, AppState *state) {
     DecoderPcm pcm = {0};
@@ -319,6 +494,12 @@ static void draw_scraper(struct nk_context *ctx, AppState *state, LibraryHandler
     if (state->method == SOURCE_SSH || state->method == SOURCE_NETWORK) {
         nk_label(ctx, "USERNAME", NK_TEXT_LEFT); nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, state->username, sizeof(state->username), nk_filter_default);
         nk_label(ctx, "IP", NK_TEXT_LEFT); nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, state->ip, sizeof(state->ip), nk_filter_default);
+        if (state->method == SOURCE_SSH) { 
+            nk_layout_row_dynamic(ctx, 28, 1); 
+            if (nk_button_label(ctx, "Choose remote music file")) choose_ssh_file(state); 
+            if (nk_button_label(ctx, "Extract SSH metadata")) extract_ssh_metadata(state); 
+            nk_layout_row_dynamic(ctx, 24, 1); 
+        }
     }
     if (state->method == SOURCE_HTTPS) {
         nk_label(ctx, "URL", NK_TEXT_LEFT); nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, state->url, sizeof(state->url), nk_filter_default);
