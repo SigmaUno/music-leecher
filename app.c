@@ -27,6 +27,7 @@
 #include <strings.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -48,6 +49,20 @@ typedef struct {
     char ssh_agent_dir[64];
     char ssh_agent_socket[96];
 } AppState;
+
+/* Zenity is a separate GTK process.  Do not let it inherit SDL, SSH-agent, or
+ * picker pipe descriptors: GLib validates inherited descriptors at startup and
+ * reports a warning when one is no longer valid. */
+static void close_extra_fds(void) {
+    struct rlimit limit;
+    int fd;
+    rlim_t maximum = 1024;
+
+    if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY)
+        maximum = limit.rlim_cur;
+    if (maximum > 65536) maximum = 65536;
+    for (fd = STDERR_FILENO + 1; (rlim_t)fd < maximum; fd++) close(fd);
+}
 
 static void launch_credential_agent(const char *program, AppState *state, const char *message) {
     pid_t pid = fork();
@@ -177,7 +192,7 @@ static int stream_ssh(const LibrarySource *source, MusicRipperWriteFn write,
     if (!command || pipe(pipe_fds) != 0) { free(command); return -1; }
     pid = fork();
     if (pid == 0) {
-        char *const arguments[] = { "ssh", "-o", "BatchMode=yes", "-o", "RequestTTY=no",
+        char *const arguments[] = { "ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "RequestTTY=no",
             "-o", "ClearAllForwardings=yes", "-o", "LogLevel=ERROR", "--", target, command, NULL };
         close(pipe_fds[0]);
         if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) _exit(127);
@@ -232,28 +247,66 @@ static int stream_https(const LibrarySource *source, MusicRipperWriteFn write,
 }
 
 static void choose_local_file(AppState *state) {
-    char path[sizeof(state->path)] = {0};
-    FILE *picker = popen("zenity --file-selection --title='Choose music file'", "r");
-    if (!picker) { snprintf(state->status, sizeof(state->status), "Could not open the system file picker."); return; }
-    if (fgets(path, sizeof(path), picker)) {
-        AudioMetadata metadata = {0};
-        char error[256] = {0};
-        
-        path[strcspn(path, "\r\n")] = '\0';
-        snprintf(state->path, sizeof(state->path), "%s", path);
-        
-        /* Try to extract metadata from the file */
-        if (metadata_extract_from_file(path, &metadata, error, sizeof(error)) == 1) {
-            if (metadata.title) snprintf(state->title, sizeof(state->title), "%s", metadata.title);
-            if (metadata.artist) snprintf(state->artist, sizeof(state->artist), "%s", metadata.artist);
-            if (metadata.album) snprintf(state->album, sizeof(state->album), "%s", metadata.album);
-            snprintf(state->status, sizeof(state->status), "Selected: %.150s (metadata extracted)", path);
-            metadata_destroy(&metadata);
-        } else {
-            snprintf(state->status, sizeof(state->status), "Selected local file: %.220s", path);
-        }
+    int pipe_fds[2];
+    pid_t pid;
+    ssize_t bytes;
+    char buffer[512];
+    int status;
+    
+    if (pipe(pipe_fds) != 0) {
+        snprintf(state->status, sizeof(state->status), "Could not create pipe for file picker.");
+        return;
     }
-    pclose(picker);
+    
+    pid = fork();
+    if (pid < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        snprintf(state->status, sizeof(state->status), "Could not fork for file picker.");
+        return;
+    }
+    
+    if (pid == 0) {
+        /* Child process */
+        close(pipe_fds[0]);
+        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) _exit(127);
+        if (pipe_fds[1] != STDOUT_FILENO) close(pipe_fds[1]);
+        close_extra_fds();
+        execlp("zenity", "zenity", "--file-selection", "--title=Choose music file", (char *)NULL);
+        _exit(127);
+    }
+    
+    /* Parent process */
+    close(pipe_fds[1]);
+    
+    bytes = read(pipe_fds[0], buffer, sizeof(buffer) - 1);
+    close(pipe_fds[0]);
+    
+    waitpid(pid, &status, 0);
+    
+    if (bytes <= 0) {
+        snprintf(state->status, sizeof(state->status), "No file selected.");
+        return;
+    }
+    
+    buffer[bytes] = '\0';
+    buffer[strcspn(buffer, "\r\n")] = '\0';
+    
+    snprintf(state->path, sizeof(state->path), "%s", buffer);
+    
+    /* Try to extract metadata from the file */
+    AudioMetadata metadata = {0};
+    char error[256] = {0};
+    
+    if (metadata_extract_from_file(buffer, &metadata, error, sizeof(error)) == 1) {
+        if (metadata.title) snprintf(state->title, sizeof(state->title), "%s", metadata.title);
+        if (metadata.artist) snprintf(state->artist, sizeof(state->artist), "%s", metadata.artist);
+        if (metadata.album) snprintf(state->album, sizeof(state->album), "%s", metadata.album);
+        snprintf(state->status, sizeof(state->status), "Selected: %.150s (metadata extracted)", buffer);
+        metadata_destroy(&metadata);
+    } else {
+        snprintf(state->status, sizeof(state->status), "Selected local file: %.220s", buffer);
+    }
 }
 
 static void extract_ssh_metadata(AppState *state) {
@@ -282,12 +335,9 @@ static void extract_ssh_metadata(AppState *state) {
 }
 
 static void choose_ssh_file(AppState *state) {
-    char path[sizeof(state->path)] = {0};
     char command[2048];
     char temp_file[256];
-    FILE *temp, *picker;
-    AudioMetadata metadata = {0};
-    char error[256] = {0};
+    FILE *temp;
     char line[512];
     int file_count = 0;
 
@@ -303,7 +353,7 @@ static void choose_ssh_file(AppState *state) {
     if (state->path[0]) {
         /* Search in the specified directory */
         if (snprintf(command, sizeof(command),
-            "ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
+            "ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
             "'find \"%s\" -maxdepth 1 -type f \\( -iname \"*.mp3\" -o -iname \"*.flac\" -o -iname \"*.ogg\" -o -iname \"*.wav\" -o -iname \"*.m4a\" \\) 2>/dev/null | sort' > %s 2>&1",
             state->username, state->ip, state->path, temp_file) >= (int)sizeof(command)) {
             snprintf(state->status, sizeof(state->status), "SSH command too long.");
@@ -312,11 +362,11 @@ static void choose_ssh_file(AppState *state) {
     } else {
         /* No PATH specified - search from home with fallbacks */
         if (snprintf(command, sizeof(command),
-            "(ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
+            "(ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
             "'find ~/ -type f \\( -iname \"*.mp3\" -o -iname \"*.flac\" -o -iname \"*.ogg\" -o -iname \"*.wav\" -o -iname \"*.m4a\" \\) 2>/dev/null' || "
-            "ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
+            "ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
             "'find ~/Music -type f 2>/dev/null' || "
-            "ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
+            "ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
             "'ls -1 ~/Music/*.mp3 ~/Music/*.flac ~/Music/*.ogg 2>/dev/null') 2>&1 | sort > %s",
             state->username, state->ip,
             state->username, state->ip,
@@ -358,58 +408,98 @@ static void choose_ssh_file(AppState *state) {
         return;
     }
 
-    /* Build zenity command - use file directly, not pipe */
-    char zenity_cmd[2048];
+    /* Use proper subprocess handling instead of popen with stdin redirection */
+    char selected_path[512] = {0};
+    pid_t picker_pid;
+    int picker_pipe[2];
+    int temp_fd;
+    int zenity_status;
+    char zenity_title[256];
+    
+    /* Create title for zenity */
     if (state->path[0]) {
-        snprintf(zenity_cmd, sizeof(zenity_cmd), 
-            "zenity --list --title='Music files in %s (%d files)' --column='File' --width=750 --height=550 < %s",
-            state->path, file_count, temp_file);
+        snprintf(zenity_title, sizeof(zenity_title), "Music files in %.220s (%d files)", state->path, file_count);
     } else {
-        snprintf(zenity_cmd, sizeof(zenity_cmd), 
-            "zenity --list --title='Choose remote music file (%d files)' --column='File' --width=750 --height=550 < %s",
-            file_count, temp_file);
+        snprintf(zenity_title, sizeof(zenity_title), "Choose remote music file (%d files)", file_count);
     }
-
-    picker = popen(zenity_cmd, "r");
-    if (!picker) {
+    
+    /* Create pipe for zenity output */
+    if (pipe(picker_pipe) != 0) {
         fclose(temp);
         unlink(temp_file);
-        snprintf(state->status, sizeof(state->status), "Could not open file picker dialog.");
+        snprintf(state->status, sizeof(state->status), "Could not create pipe for file picker.");
         return;
     }
-
-    if (fgets(path, sizeof(path), picker)) {
-        int status = pclose(picker);
+    
+    picker_pid = fork();
+    if (picker_pid < 0) {
+        close(picker_pipe[0]);
+        close(picker_pipe[1]);
+        fclose(temp);
+        unlink(temp_file);
+        snprintf(state->status, sizeof(state->status), "Could not fork for file picker.");
+        return;
+    }
+    
+    if (picker_pid == 0) {
+        /* Child process */
+        close(picker_pipe[0]);
         
-        /* Check if user actually selected something (zenity returns 0 on success) */
-        if (status == 0 && path[0]) {
-            path[strcspn(path, "\r\n")] = '\0';
-            
-            if (path[0]) {
-                snprintf(state->path, sizeof(state->path), "%s", path);
+        /* Redirect stdout to pipe */
+        if (dup2(picker_pipe[1], STDOUT_FILENO) < 0) _exit(127);
+        if (picker_pipe[1] != STDOUT_FILENO) close(picker_pipe[1]);
+        
+        /* Open temp file and redirect to stdin */
+        temp_fd = open(temp_file, O_RDONLY);
+        if (temp_fd < 0) _exit(127);
+        if (dup2(temp_fd, STDIN_FILENO) < 0) _exit(127);
+        if (temp_fd != STDIN_FILENO) close(temp_fd);
 
-                /* Try to extract metadata from the remote file */
-                if (metadata_extract_from_ssh(state->username, state->ip, path, &metadata, error, sizeof(error)) == 1) {
-                    if (metadata.title) snprintf(state->title, sizeof(state->title), "%s", metadata.title);
-                    if (metadata.artist) snprintf(state->artist, sizeof(state->artist), "%s", metadata.artist);
-                    if (metadata.album) snprintf(state->album, sizeof(state->album), "%s", metadata.album);
-                    snprintf(state->status, sizeof(state->status), "Selected: %.100s (metadata extracted)", path);
-                    metadata_destroy(&metadata);
-                } else {
-                    snprintf(state->status, sizeof(state->status), "Selected: %.150s (metadata unavailable on remote)", path);
-                }
+        close_extra_fds();
+        
+        /* Execute zenity */
+        execlp("zenity", "zenity", "--list", "--title", zenity_title, 
+               "--column=File", "--width=750", "--height=550", (char *)NULL);
+        _exit(127);
+    }
+    
+    /* Parent process */
+    close(picker_pipe[1]);
+    fclose(temp);
+    
+    /* Read selected file from zenity output */
+    ssize_t bytes = read(picker_pipe[0], selected_path, sizeof(selected_path) - 1);
+    close(picker_pipe[0]);
+    
+    waitpid(picker_pid, &zenity_status, 0);
+    
+    if (bytes > 0 && WIFEXITED(zenity_status) && WEXITSTATUS(zenity_status) == 0) {
+        selected_path[bytes] = '\0';
+        selected_path[strcspn(selected_path, "\r\n")] = '\0';
+        
+        if (selected_path[0]) {
+            snprintf(state->path, sizeof(state->path), "%s", selected_path);
+
+            /* Try to extract metadata from the remote file */
+            AudioMetadata metadata = {0};
+            char error[256] = {0};
+            
+            if (metadata_extract_from_ssh(state->username, state->ip, selected_path, &metadata, error, sizeof(error)) == 1) {
+                if (metadata.title) snprintf(state->title, sizeof(state->title), "%s", metadata.title);
+                if (metadata.artist) snprintf(state->artist, sizeof(state->artist), "%s", metadata.artist);
+                if (metadata.album) snprintf(state->album, sizeof(state->album), "%s", metadata.album);
+                snprintf(state->status, sizeof(state->status), "Selected: %.100s (metadata extracted)", selected_path);
+                metadata_destroy(&metadata);
             } else {
-                snprintf(state->status, sizeof(state->status), "No file selected.");
+                snprintf(state->status, sizeof(state->status), "Selected: %.150s (metadata unavailable on remote)", selected_path);
             }
         } else {
             snprintf(state->status, sizeof(state->status), "No file selected.");
         }
     } else {
-        pclose(picker);
         snprintf(state->status, sizeof(state->status), "File picker was cancelled or failed.");
     }
 
-    fclose(temp);
     unlink(temp_file);
 }
 

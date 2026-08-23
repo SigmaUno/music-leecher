@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 static void set_error(char *error, size_t error_size, const char *format, ...) {
@@ -46,16 +47,16 @@ static int valid_ssh_name(const char *value, int allow_colon) {
     return 1;
 }
 
-/* Quote SSH path to prevent shell injection */
-static char *remote_cat_command(const char *path) {
+/* Build a remote shell command with a safely single-quoted path argument. */
+static char *remote_command_with_path(const char *prefix, const char *path) {
     const char *cursor;
     char *command, *out;
-    size_t length = 8; /* "cat -- " plus the final NUL */
+    size_t length = strlen(prefix) + 3; /* prefix, enclosing quotes, final NUL */
     for (cursor = path; *cursor; cursor++) length += *cursor == '\'' ? 4 : 1;
-    command = malloc(length + 2); /* enclosing single quotes */
+    command = malloc(length);
     if (!command) return NULL;
     out = command;
-    memcpy(out, "cat -- ", 7); out += 7;
+    memcpy(out, prefix, strlen(prefix)); out += strlen(prefix);
     *out++ = '\'';
     for (cursor = path; *cursor; cursor++) {
         if (*cursor == '\'') { memcpy(out, "'\\''", 4); out += 4; }
@@ -64,6 +65,11 @@ static char *remote_cat_command(const char *path) {
     *out++ = '\'';
     *out = '\0';
     return command;
+}
+
+/* Quote one argument for the local shell that invokes ssh. */
+static char *shell_quote(const char *value) {
+    return remote_command_with_path("", value);
 }
 
 /* Parse key=value format output from mediainfo */
@@ -81,6 +87,23 @@ static void parse_mediainfo_line(const char *line, AudioMetadata *metadata) {
     } else if (strcmp(key, "Album") == 0 && !metadata->album) {
         metadata->album = malloc(strlen(value) + 1);
         if (metadata->album) strcpy(metadata->album, value);
+    }
+}
+
+static void parse_ffprobe_line(const char *line, AudioMetadata *metadata) {
+    char key[256], value[256];
+    const char *tag;
+
+    if (sscanf(line, "%255[^=]=%255[^\n]", key, value) != 2) return;
+    trim_string(key);
+    trim_string(value);
+    tag = strncasecmp(key, "TAG:", 4) == 0 ? key + 4 : key;
+    if (strcasecmp(tag, "title") == 0 && !metadata->title) {
+        metadata->title = strdup(value);
+    } else if (strcasecmp(tag, "artist") == 0 && !metadata->artist) {
+        metadata->artist = strdup(value);
+    } else if (strcasecmp(tag, "album") == 0 && !metadata->album) {
+        metadata->album = strdup(value);
     }
 }
 
@@ -115,7 +138,7 @@ static int extract_with_ffprobe(const char *filepath, AudioMetadata *metadata, c
     char command[1024];
     char line[512];
 
-    if (snprintf(command, sizeof(command), "ffprobe -v error -show_format -print_format compact=p=\\: '%s' 2>/dev/null | grep -E '(title|artist|album)='", filepath) >= (int)sizeof(command)) {
+    if (snprintf(command, sizeof(command), "ffprobe -v error -show_entries format_tags -of default=noprint_wrappers=1 '%s' 2>/dev/null", filepath) >= (int)sizeof(command)) {
         set_error(error, error_size, "Command path too long");
         return -1;
     }
@@ -128,23 +151,7 @@ static int extract_with_ffprobe(const char *filepath, AudioMetadata *metadata, c
 
     while (fgets(line, sizeof(line), pipe)) {
         line[strcspn(line, "\r\n")] = '\0';
-        char *sep = strchr(line, '=');
-        if (sep) {
-            *sep = '\0';
-            const char *key = line;
-            const char *value = sep + 1;
-            
-            if (strcmp(key, "TAG:title") == 0 && !metadata->title) {
-                metadata->title = malloc(strlen(value) + 1);
-                if (metadata->title) strcpy(metadata->title, value);
-            } else if (strcmp(key, "TAG:artist") == 0 && !metadata->artist) {
-                metadata->artist = malloc(strlen(value) + 1);
-                if (metadata->artist) strcpy(metadata->artist, value);
-            } else if (strcmp(key, "TAG:album") == 0 && !metadata->album) {
-                metadata->album = malloc(strlen(value) + 1);
-                if (metadata->album) strcpy(metadata->album, value);
-            }
-        }
+        if (*line) parse_ffprobe_line(line, metadata);
     }
     pclose(pipe);
     return (metadata->title || metadata->artist || metadata->album) ? 1 : 0;
@@ -186,6 +193,7 @@ static int extract_ssh_metadata_with_tool(const char *username, const char *ip, 
     char line[512];
     int result;
     char *remote_cmd = NULL;
+    char *quoted_remote_cmd = NULL;
 
     /* Verify SSH credentials format */
     if (!username || !*username || !ip || !*ip || !filepath || !*filepath) {
@@ -202,30 +210,48 @@ static int extract_ssh_metadata_with_tool(const char *username, const char *ip, 
     /* For mediainfo: use remote file directly (doesn't support stdin).
      * For ffprobe: pipe through stdin (does support stdin) */
     if (strcmp(tool, "mediainfo") == 0) {
-        /* mediainfo needs direct file access, not piped input.
-         * Quote the filepath safely for shell. */
-        result = snprintf(command, sizeof(command),
-            "ssh -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR -- %s@%s "
-            "'mediainfo --Output=\"General;Title=%%Title%% \\nPerformer=%%Performer%% \\nAlbum=%%Album%%\" -- '\"'\"'%s'\"'\"'' 2>/dev/null",
-            username, ip, filepath);
-    } else if (strcmp(tool, "ffprobe") == 0) {
-        /* ffprobe supports piped input via /dev/stdin */
-        remote_cmd = remote_cat_command(filepath);
+        remote_cmd = remote_command_with_path(
+            "mediainfo --Output='General;Title=%Title% \\nPerformer=%Performer% \\nAlbum=%Album%' -- ",
+            filepath);
         if (!remote_cmd) {
             set_error(error, error_size, "Path too long");
             return -1;
         }
-        result = snprintf(command, sizeof(command),
-            "ssh -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR -- %s@%s %s 2>/dev/null | ffprobe -v error -show_format -print_format compact=p=\\: - 2>/dev/null | grep -E '(title|artist|album)='",
-            username, ip, remote_cmd);
+    } else if (strcmp(tool, "ffprobe") == 0) {
+        remote_cmd = remote_command_with_path(
+            "ffprobe -v error -show_entries format_tags -of default=noprint_wrappers=1 -- ",
+            filepath);
+        if (!remote_cmd) {
+            set_error(error, error_size, "Path too long");
+            return -1;
+        }
     } else {
         if (remote_cmd) free(remote_cmd);
         set_error(error, error_size, "Unknown metadata tool");
         return -1;
     }
 
+    quoted_remote_cmd = shell_quote(remote_cmd);
+    if (!quoted_remote_cmd) {
+        free(remote_cmd);
+        set_error(error, error_size, "Command too long");
+        return -1;
+    }
+
+    if (strcmp(tool, "mediainfo") == 0) {
+        result = snprintf(command, sizeof(command),
+            "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR -- %s@%s "
+            "%s 2>/dev/null",
+            username, ip, quoted_remote_cmd);
+    } else {
+        result = snprintf(command, sizeof(command),
+            "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR -- %s@%s %s 2>/dev/null",
+            username, ip, quoted_remote_cmd);
+    }
+    free(quoted_remote_cmd);
+
     if (result >= (int)sizeof(command)) {
-        if (remote_cmd) free(remote_cmd);
+        free(remote_cmd);
         set_error(error, error_size, "Command too long");
         return -1;
     }
@@ -245,23 +271,7 @@ static int extract_ssh_metadata_with_tool(const char *username, const char *ip, 
     } else {
         while (fgets(line, sizeof(line), pipe)) {
             line[strcspn(line, "\r\n")] = '\0';
-            char *sep = strchr(line, '=');
-            if (sep) {
-                *sep = '\0';
-                const char *key = line;
-                const char *value = sep + 1;
-                
-                if (strcmp(key, "TAG:title") == 0 && !metadata->title) {
-                    metadata->title = malloc(strlen(value) + 1);
-                    if (metadata->title) strcpy(metadata->title, value);
-                } else if (strcmp(key, "TAG:artist") == 0 && !metadata->artist) {
-                    metadata->artist = malloc(strlen(value) + 1);
-                    if (metadata->artist) strcpy(metadata->artist, value);
-                } else if (strcmp(key, "TAG:album") == 0 && !metadata->album) {
-                    metadata->album = malloc(strlen(value) + 1);
-                    if (metadata->album) strcpy(metadata->album, value);
-                }
-            }
+            if (*line) parse_ffprobe_line(line, metadata);
         }
     }
 
