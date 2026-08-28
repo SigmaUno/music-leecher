@@ -416,6 +416,152 @@ int library_handler_add_source(const char *library_path, const LibrarySongQuery 
     free(new_json); return 1;
 }
 
+static char *json_quote_alloc(const char *value) {
+    size_t capacity = 2 + strlen(value == NULL ? "" : value) * 6 + 1, length = 0;
+    char *buffer = calloc(capacity, 1);
+    if (!buffer) return NULL;
+    append_json_string(buffer, capacity, &length, value == NULL ? "" : value);
+    return buffer;
+}
+
+typedef struct { int start; int end; char *slice; } TrackEdit;
+
+static void track_edits_free(TrackEdit *edits, int how_many) {
+    int i;
+    for (i = 0; i < how_many; i++) free(edits[i].slice);
+}
+
+static void track_edits_sort(TrackEdit *edits, int how_many) {
+    int a, b;
+    for (a = 1; a < how_many; a++) {
+        TrackEdit key = edits[a];
+        for (b = a; b > 0 && edits[b - 1].start > key.start; b--) edits[b] = edits[b - 1];
+        edits[b] = key;
+    }
+}
+
+int library_handler_update_track(const char *library_path, size_t track_index,
+                                 const char *title, const char *artist, const char *album,
+                                 char *error, size_t error_size) {
+    LibraryHandler *handler;
+    int count, object, track_object = -1;
+    size_t current = 0, cursor = 0, how_many = 0, i;
+    char *new_json;
+    TrackEdit edits[3];
+    const char *fields[3] = { title, artist, album };
+    const char *keys[3] = { "title", "artist", "album" };
+    if (!library_path) { set_error(error, error_size, "library path is required"); return -1; }
+    if (!title && !artist && !album) { set_error(error, error_size, "nothing to update"); return -1; }
+    handler = library_handler_open(library_path, error, error_size);
+    if (!handler) return -1;
+    count = handler->token_count; object = handler->tracks_token;
+    for (i = (size_t)object + 1; i < (size_t)count && handler->tokens[i].start < handler->tokens[object].end; i = (size_t)token_skip(handler->tokens, count, (int)i)) {
+        if (handler->tokens[i].parent != object || handler->tokens[i].type != JSMN_OBJECT) continue;
+        if (current++ == track_index) { track_object = (int)i; break; }
+    }
+    if (track_object < 0) { set_error(error, error_size, "track index out of range"); library_handler_close(handler); return -1; }
+    {
+        char *insert_combined = NULL; /* combined `,"k":"v","k2":"v2"` for missing fields */
+        size_t insert_len = 0, insert_cap = 0, j;
+        for (i = 0; i < 3; i++) {
+            int value_token;
+            if (!fields[i]) continue;
+            value_token = object_value(handler->json, handler->tokens, count, track_object, keys[i]);
+            if (value_token >= 0) {
+                edits[how_many].slice = json_quote_alloc(fields[i]);
+                if (!edits[how_many].slice) { track_edits_free(edits, (int)how_many); library_handler_close(handler); set_error(error, error_size, "out of memory"); return -1; }
+                edits[how_many].start = handler->tokens[value_token].start - 1;
+                edits[how_many].end = handler->tokens[value_token].end + 1;
+                how_many++;
+            } else {
+                /* Missing field: append `,"key":"value"` to the combined insertion block. */
+                char *value = json_quote_alloc(fields[i]);
+                size_t add = strlen(keys[i]) + (value ? strlen(value) : 0) + 4; /* ":" plus comma + quotes around key */
+                if (!value) { track_edits_free(edits, (int)how_many); free(insert_combined); library_handler_close(handler); set_error(error, error_size, "out of memory"); return -1; }
+                if (insert_len + add + 1 > insert_cap) { char *grown; insert_cap = (insert_len + add + 1) * 2 + 8; grown = realloc(insert_combined, insert_cap); if (!grown) { free(value); track_edits_free(edits, (int)how_many); free(insert_combined); library_handler_close(handler); set_error(error, error_size, "out of memory"); return -1; } insert_combined = grown; }
+                append_text(insert_combined, insert_cap, &insert_len, ",");
+                append_text(insert_combined, insert_cap, &insert_len, "\"");
+                append_text(insert_combined, insert_cap, &insert_len, keys[i]);
+                append_text(insert_combined, insert_cap, &insert_len, "\":");
+                append_text(insert_combined, insert_cap, &insert_len, value);
+                free(value);
+            }
+        }
+        if (insert_combined) {
+            /* All missing fields inserted in one edit just before the closing brace. */
+            edits[how_many].slice = insert_combined;
+            edits[how_many].start = handler->tokens[track_object].end - 1;
+            edits[how_many].end = handler->tokens[track_object].end - 1;
+            how_many++;
+        }
+        track_edits_sort(edits, (int)how_many);
+        {
+            size_t total = strlen(handler->json) + 1;
+            for (j = 0; j < how_many; j++) total += strlen(edits[j].slice);
+            new_json = calloc(total, 1);
+            if (!new_json) { track_edits_free(edits, (int)how_many); library_handler_close(handler); set_error(error, error_size, "out of memory"); return -1; }
+        }
+    }
+    {
+        size_t out = 0, j;
+            for (j = 0; j < how_many; j++) {
+                size_t gap = (size_t)edits[j].start - cursor;
+                memcpy(new_json + out, handler->json + cursor, gap); out += gap;
+                memcpy(new_json + out, edits[j].slice, strlen(edits[j].slice)); out += strlen(edits[j].slice);
+                cursor = (size_t)edits[j].end;
+            }
+            strcpy(new_json + out, handler->json + cursor);
+    }
+    track_edits_free(edits, (int)how_many);
+    library_handler_close(handler);
+    if (!write_atomic(library_path, new_json, strlen(new_json))) { free(new_json); set_error(error, error_size, "could not atomically write library"); return -1; }
+    free(new_json);
+    return 1;
+}
+
+int library_handler_remove_track(const char *library_path, size_t track_index,
+                                 char *error, size_t error_size) {
+    LibraryHandler *handler;
+    int count, object, track_object = -1;
+    size_t current = 0, i;
+    int remove_start, remove_end, k;
+    char *new_json;
+    if (!library_path) { set_error(error, error_size, "library path is required"); return -1; }
+    handler = library_handler_open(library_path, error, error_size);
+    if (!handler) return -1;
+    count = handler->token_count; object = handler->tracks_token;
+    for (i = (size_t)object + 1; i < (size_t)count && handler->tokens[i].start < handler->tokens[object].end; i = (size_t)token_skip(handler->tokens, count, (int)i)) {
+        if (handler->tokens[i].parent != object || handler->tokens[i].type != JSMN_OBJECT) continue;
+        if (current++ == track_index) { track_object = (int)i; break; }
+    }
+    if (track_object < 0) { set_error(error, error_size, "track index out of range"); library_handler_close(handler); return -1; }
+    remove_start = handler->tokens[track_object].start;
+    remove_end = handler->tokens[track_object].end;
+    /* Consume the comma separating this element from the previous one, if any. */
+    for (k = remove_start - 1; k >= 0 && (handler->json[k] == ' ' || handler->json[k] == '\t' || handler->json[k] == '\n' || handler->json[k] == '\r'); k--) {}
+    if (k >= 0 && handler->json[k] == ',') remove_start = k;
+    else {
+        /* This was the first element: instead consume the trailing comma so the
+         * following element does not end up with a leading comma. */
+        k = remove_end;
+        while (handler->json[k] == ' ' || handler->json[k] == '\t' || handler->json[k] == '\n' || handler->json[k] == '\r') k++;
+        if (handler->json[k] == ',') remove_end = k + 1;
+    }
+    {
+        size_t head = (size_t)remove_start;
+        const char *tail = handler->json + remove_end;
+        size_t total = head + strlen(tail) + 1;
+        new_json = malloc(total);
+        if (!new_json) { library_handler_close(handler); set_error(error, error_size, "out of memory"); return -1; }
+        memcpy(new_json, handler->json, head);
+        strcpy(new_json + head, tail);
+    }
+    library_handler_close(handler);
+    if (!write_atomic(library_path, new_json, strlen(new_json))) { free(new_json); set_error(error, error_size, "could not atomically write library"); return -1; }
+    free(new_json);
+    return 1;
+}
+
 #ifdef LIBRARY_HANDLER_STANDALONE
 static void respond_error(const char *request_id, const char *message) {
     fputs("{\"request_id\":", stdout); print_json_string(request_id); fputs(",\"ok\":false,\"error\":", stdout); print_json_string(message); puts("}");

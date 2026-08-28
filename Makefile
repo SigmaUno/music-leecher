@@ -3,10 +3,10 @@ CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
 
 .PHONY: all clean test
 
-all: library-handler
+all: app library-handler
 
 app: app.c library_handler.c library_handler.h music_ripper.c music_ripper.h assembler.c assembler.h decoder.c decoder.h metadata.c metadata.h third_party/nuklear/nuklear.h third_party/nuklear/nuklear_sdl_renderer.h
-	$(CC) $(CFLAGS) -I. app.c library_handler.c music_ripper.c assembler.c decoder.c metadata.c $$(pkg-config --cflags --libs sdl2 sndfile) -lm -o $@
+	$(CC) $(CFLAGS) -I. app.c library_handler.c music_ripper.c assembler.c decoder.c metadata.c $$(pkg-config --cflags --libs sdl2 sndfile) -pthread -lm -o $@
 
 library-handler: library_handler.c
 	$(CC) $(CFLAGS) -DLIBRARY_HANDLER_STANDALONE $< -o $@
