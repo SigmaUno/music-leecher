@@ -1101,7 +1101,7 @@ static void extract_source_cover(const LibrarySource *source, char *out, size_t 
         break;
     }
     case LIBRARY_SOURCE_HTTPS: {
-        if (!source->url || !source->url[0]) return;
+        if (!source->url || strncasecmp(source->url, "https://", 8) != 0) return;
         char *q = shell_quote_words(source->url);
         if (q) { run_ffmpeg_cover(q, out, out_size, 15000, cancel); free(q); }
         break;
