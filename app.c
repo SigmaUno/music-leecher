@@ -965,11 +965,16 @@ static int ssh_name_valid(const char *value, int allow_colon) {
 }
 
 /* Runs `cmd` via /bin/sh -c in its own process group, bounded by timeout_ms.
- * Returns the child's exit status (or -1 on setup failure / timeout). The
- * process group kill on timeout ensures any grandchildren (ssh, ffmpeg, curl)
- * are also terminated, so a stuck network source can never hang the player. */
-static int run_command_timeout(const char *cmd, int timeout_ms) {
+ * Returns the child's exit status (or -1 on setup failure / timeout / cancel).
+ * The process group kill on timeout ensures any grandchildren (ssh, ffmpeg,
+ * curl) are also terminated, so a stuck network source can never hang the
+ * player.  When `cancel` is set (non-NULL and non-zero) the child group is
+ * killed and -1 returned immediately, so aborting a fetch in the worker thread
+ * never blocks the caller. */
+static int run_command_timeout(const char *cmd, int timeout_ms, const volatile int *cancel) {
     pid_t pid = fork();
+    int status;
+    int waited = 0;
     if (pid < 0) return -1;
     if (pid == 0) {
         signal(SIGINT, SIG_DFL);
@@ -980,9 +985,13 @@ static int run_command_timeout(const char *cmd, int timeout_ms) {
         _exit(127);
     }
     signal(SIGPIPE, SIG_IGN);
-    int status;
-    int waited = 0;
     while (waited < timeout_ms) {
+        if (cancel && *cancel) {
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return -1;
+        }
         pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid) return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         usleep(50000);
@@ -998,7 +1007,8 @@ static int run_command_timeout(const char *cmd, int timeout_ms) {
  * already shell-quoted ffmpeg input argument) into the per-user cover file,
  * writing the resulting path into `out` (cleared when no attached picture is
  * found). */
-static void run_ffmpeg_cover(const char *input, char *out, size_t out_size, int timeout_ms) {
+static void run_ffmpeg_cover(const char *input, char *out, size_t out_size, int timeout_ms,
+                             const volatile int *cancel) {
     char command[3600];
     char *qcover;
     struct stat st;
@@ -1012,7 +1022,7 @@ static void run_ffmpeg_cover(const char *input, char *out, size_t out_size, int 
         return;
     }
     free(qcover);
-    if (run_command_timeout(command, timeout_ms) == 0 && stat(cover_file, &st) == 0 && st.st_size > 0)
+    if (run_command_timeout(command, timeout_ms, cancel) == 0 && stat(cover_file, &st) == 0 && st.st_size > 0)
         snprintf(out, out_size, "%s", cover_file);
 }
 
@@ -1020,21 +1030,25 @@ static void run_ffmpeg_cover(const char *input, char *out, size_t out_size, int 
  * cover file using ffmpeg, and writes its path into `out` (cleared when there
  * is no embedded art). Local files and HTTPS URLs are passed straight to
  * ffmpeg; SSH/network files are streamed over ssh to ffmpeg's stdin so only
- * the tiny cover frame is transferred, not the whole track. */
-static void extract_source_cover(const LibrarySource *source, char *out, size_t out_size) {
+ * the tiny cover frame is transferred, not the whole track.  `cancel` (may be
+ * NULL) is polled so a long ffmpeg/ssh run aborts promptly when a fetch is
+ * cancelled, instead of stalling the worker (and the main loop that joins it)
+ * for the full timeout. */
+static void extract_source_cover(const LibrarySource *source, char *out, size_t out_size,
+                                 const volatile int *cancel) {
     out[0] = '\0';
     if (!source) return;
     switch (source->kind) {
     case LIBRARY_SOURCE_LOCAL: {
         if (!source->path || !source->path[0]) return;
         char *q = shell_quote_words(source->path);
-        if (q) { run_ffmpeg_cover(q, out, out_size, 10000); free(q); }
+        if (q) { run_ffmpeg_cover(q, out, out_size, 10000, cancel); free(q); }
         break;
     }
     case LIBRARY_SOURCE_HTTPS: {
         if (!source->url || !source->url[0]) return;
         char *q = shell_quote_words(source->url);
-        if (q) { run_ffmpeg_cover(q, out, out_size, 15000); free(q); }
+        if (q) { run_ffmpeg_cover(q, out, out_size, 15000, cancel); free(q); }
         break;
     }
     case LIBRARY_SOURCE_SSH:
@@ -1063,7 +1077,7 @@ static void extract_source_cover(const LibrarySource *source, char *out, size_t 
         if (wrote >= (int)sizeof(command))
             return;
         struct stat st;
-        if (run_command_timeout(command, 8000) == 0 && stat(cover_file, &st) == 0 && st.st_size > 0)
+        if (run_command_timeout(command, 8000, cancel) == 0 && stat(cover_file, &st) == 0 && st.st_size > 0)
             snprintf(out, out_size, "%s", cover_file);
         break;
     }
@@ -1088,7 +1102,7 @@ static void *fetch_worker(void *arg) {
         if (track.artist) snprintf(save_artist, sizeof(save_artist), "%s", track.artist);
         if (track.album) snprintf(save_album, sizeof(save_album), "%s", track.album);
         for (size_t ci = 0; ci < track.source_count && save_cover[0] == '\0'; ci++) {
-            extract_source_cover(&track.sources[ci], save_cover, sizeof(save_cover));
+            extract_source_cover(&track.sources[ci], save_cover, sizeof(save_cover), &s->fetch_cancel);
         }
         if (save_cover[0]) {
             char unique[420];
