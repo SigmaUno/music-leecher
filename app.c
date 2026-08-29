@@ -187,22 +187,51 @@ static char *json_escape(const char *value) {
     return out;
 }
 
+/* Write a file atomically: write to a temp inode then rename(2) over the
+ * target.  A concurrent reader (the widget cat's + parses this file every
+ * second) sees either the old complete content or the new complete content,
+ * never a partially-written buffer. */
+static int atomic_write(const char *path, const char *data, size_t size) {
+    size_t template_length = strlen(path) + 16;
+    char *temporary_path = malloc(template_length);
+    FILE *file;
+    int fd, ok;
+    if (!temporary_path) return 0;
+    snprintf(temporary_path, template_length, "%s.tmp.XXXXXX", path);
+    fd = mkstemp(temporary_path);
+    if (fd < 0) { free(temporary_path); return 0; }
+    file = fdopen(fd, "wb");
+    if (!file) { close(fd); unlink(temporary_path); free(temporary_path); return 0; }
+    ok = fwrite(data, 1, size, file) == size;
+    if (ok) ok = fflush(file) == 0;
+    if (ok) ok = fsync(fd) == 0;
+    if (fclose(file) != 0) ok = 0;
+    if (!ok) { unlink(temporary_path); free(temporary_path); return 0; }
+    ok = rename(temporary_path, path) == 0;
+    if (!ok) unlink(temporary_path);
+    free(temporary_path);
+    return ok;
+}
+
 static void write_status(const AppState *state) {
+    /* mkstemp creates the temp file 0600; rename preserves it, so the status
+     * file stays private even when the first write races with the unlink. */
     char *title = json_escape(state->title), *artist = json_escape(state->artist),
          *album = json_escape(state->album), *library = json_escape(state->library_path),
          *cover = json_escape(state->cover_file[0] ? state->cover_file : NULL);
-    FILE *file = fopen(status_file, "w");
-    if (!file) { free(title); free(artist); free(album); free(library); free(cover); return; }
-    if (fchmod(fileno(file), 0600) < 0) { /* best-effort; dir is already 0700 */ }
-    fprintf(file, "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
-                  "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,\"cover\":\"%s\"}\n",
-            title ? title : "", artist ? artist : "", album ? album : "",
-            state->position_ms, state->duration_ms,
-            state->is_playing ? "true" : "false", state->selected_track,
-            library ? library : "", state->autoplay ? "true" : "false",
-            cover ? cover : "");
-    fclose(file);
+    char tmp[4096];
+    int n;
+    n = snprintf(tmp, sizeof(tmp),
+                 "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
+                 "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,\"cover\":\"%s\"}\n",
+                 title ? title : "", artist ? artist : "", album ? album : "",
+                 state->position_ms, state->duration_ms,
+                 state->is_playing ? "true" : "false", state->selected_track,
+                 library ? library : "", state->autoplay ? "true" : "false",
+                 cover ? cover : "");
     free(title); free(artist); free(album); free(library); free(cover);
+    if (n < 0 || (size_t)n >= sizeof(tmp)) return; /* oversized; leave old status intact */
+    atomic_write(status_file, tmp, (size_t)n);
 }
 
 /* Zenity is a separate GTK process.  Do not let it inherit SDL, SSH-agent, or
