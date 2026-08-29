@@ -273,6 +273,97 @@ static char *remote_cat_command(const char *path) {
     return command;
 }
 
+/* Single-quote `value` for use inside a remote (or local) shell command, so it
+ * is always treated literally and can never inject additional commands. Returns
+ * a malloc'd string the caller must free, or NULL on allocation failure. */
+static char *ssh_quote(const char *value) {
+    size_t len = 3, i;
+    char *out;
+    if (!value) value = "";
+    for (i = 0; value[i]; i++) len += value[i] == '\'' ? 4 : 1;
+    out = malloc(len);
+    if (!out) return NULL;
+    {   char *p = out; *p++ = '\'';
+        for (i = 0; value[i]; i++) {
+            if (value[i] == '\'') { memcpy(p, "'\\''", 4); p += 4; }
+            else *p++ = value[i];
+        }
+        *p++ = '\''; *p = '\0';
+    }
+    return out;
+}
+
+/* Build a remote shell command that lists music files under `path`, ready to be
+ * passed through `ssh -- target <command>`. `path` is single-quoted so it is
+ * evaluated literally by the remote shell (no injection). When `path` is empty
+ * or NULL, search the remote home directory as a fallback set. Returns a
+ * malloc'd string the caller must free, or NULL on allocation failure. */
+static char *remote_find_command(const char *path) {
+    static const char *names =
+        "\\( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.ogg' "
+        "-o -iname '*.wav' -o -iname '*.m4a' \\)";
+    char *cmd, *quoted;
+    size_t len;
+
+    if (path && path[0]) {
+        quoted = ssh_quote(path);
+        if (!quoted) return NULL;
+        len = strlen("find ") + strlen(quoted) + strlen(" -maxdepth 1 -type f ") +
+              strlen(names) + strlen(" 2>/dev/null | sort") + 1;
+        cmd = malloc(len);
+        if (cmd)
+            snprintf(cmd, len, "find %s -maxdepth 1 -type f %s 2>/dev/null | sort",
+                     quoted, names);
+        free(quoted);
+        return cmd;
+    }
+
+    len = strlen("(find ~/ -type f ") + strlen(names) + strlen(" 2>/dev/null || "
+        "find ~/Music -type f 2>/dev/null || "
+        "ls -1 ~/Music/*.mp3 ~/Music/*.flac ~/Music/*.ogg 2>/dev/null) | sort") + 1;
+    cmd = malloc(len);
+    if (cmd)
+        snprintf(cmd, len, "(find ~/ -type f %s 2>/dev/null || "
+            "find ~/Music -type f 2>/dev/null || "
+            "ls -1 ~/Music/*.mp3 ~/Music/*.flac ~/Music/*.ogg 2>/dev/null) | sort",
+            names);
+    return cmd;
+}
+
+/* Run `ssh -- user@host <remote_command>` with stdout and stderr redirected into
+ * `dest_path`. Avoids system()/shell entirely: `remote_command` is a single
+ * argv element, so nothing local is interpreted. USERNAME/IP are validated so a
+ * crafted value cannot become extra arguments. Returns the ssh exit status, or
+ * -1 on validation/exec/setup failure. */
+static int run_ssh_to_file(const char *username, const char *ip,
+                           const char *remote_command, const char *dest_path) {
+    char target[256];
+    int fd, status;
+    pid_t pid;
+
+    if (!remote_command || !valid_ssh_name(username, 0) || !valid_ssh_name(ip, 1))
+        return -1;
+    if (snprintf(target, sizeof(target), "%s@%s", username, ip) >= (int)sizeof(target))
+        return -1;
+    fd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -1;
+    pid = fork();
+    if (pid == 0) {
+        char *const arguments[] = { "ssh", "-F", "/dev/null", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+            "--", target, (char *)remote_command, NULL };
+        if (dup2(fd, STDOUT_FILENO) < 0) _exit(127);
+        if (dup2(fd, STDERR_FILENO) < 0) _exit(127);
+        close(fd);
+        execvp(arguments[0], arguments);
+        _exit(127);
+    }
+    close(fd);
+    if (pid < 0) return -1;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
 static int stream_ssh(const LibrarySource *source, MusicRipperWriteFn write,
                       void *write_userdata, void *transport_userdata) {
     char target[256];
@@ -436,8 +527,8 @@ static void extract_ssh_metadata(AppState *state) {
 }
 
 static void choose_ssh_file(AppState *state) {
-    char command[2048];
     char temp_file[256];
+    char *remote;
     FILE *temp;
     char line[512];
     int file_count = 0;
@@ -446,44 +537,35 @@ static void choose_ssh_file(AppState *state) {
         snprintf(state->status, sizeof(state->status), "Enter USERNAME and IP first.");
         return;
     }
-
-    /* Create temp file for file list output */
-    snprintf(temp_file, sizeof(temp_file), "/tmp/music_files_%ld.txt", (long)time(NULL));
-
-    /* If PATH is already entered, search only in that directory */
-    if (state->path[0]) {
-        /* Search in the specified directory */
-        if (snprintf(command, sizeof(command),
-            "ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
-            "'find \"%s\" -maxdepth 1 -type f \\( -iname \"*.mp3\" -o -iname \"*.flac\" -o -iname \"*.ogg\" -o -iname \"*.wav\" -o -iname \"*.m4a\" \\) 2>/dev/null | sort' > %s 2>&1",
-            state->username, state->ip, state->path, temp_file) >= (int)sizeof(command)) {
-            snprintf(state->status, sizeof(state->status), "SSH command too long.");
-            return;
-        }
-    } else {
-        /* No PATH specified - search from home with fallbacks */
-        if (snprintf(command, sizeof(command),
-            "(ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
-            "'find ~/ -type f \\( -iname \"*.mp3\" -o -iname \"*.flac\" -o -iname \"*.ogg\" -o -iname \"*.wav\" -o -iname \"*.m4a\" \\) 2>/dev/null' || "
-            "ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
-            "'find ~/Music -type f 2>/dev/null' || "
-            "ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
-            "'ls -1 ~/Music/*.mp3 ~/Music/*.flac ~/Music/*.ogg 2>/dev/null') 2>&1 | sort > %s",
-            state->username, state->ip,
-            state->username, state->ip,
-            state->username, state->ip,
-            temp_file) >= (int)sizeof(command)) {
-            snprintf(state->status, sizeof(state->status), "SSH command too long.");
-            return;
-        }
+    if (!valid_ssh_name(state->username, 0) || !valid_ssh_name(state->ip, 1)) {
+        snprintf(state->status, sizeof(state->status), "USERNAME/IP contains invalid characters.");
+        return;
     }
 
-    /* Execute the command and wait for completion */
-    system(command);
+    /* Secure temp file for the list output; unlinked at the end of the function. */
+    snprintf(temp_file, sizeof(temp_file), "/tmp/leecher_files_XXXXXX");
+    int fd = mkstemp(temp_file);
+    if (fd < 0) {
+        snprintf(state->status, sizeof(state->status), "Could not create temp file for SSH list.");
+        return;
+    }
+    close(fd);
+
+    /* Build the remote find command (the path is single-quoted so the remote
+     * shell treats it literally) and run ssh without any local shell. */
+    remote = remote_find_command(state->path);
+    if (!remote) {
+        unlink(temp_file);
+        snprintf(state->status, sizeof(state->status), "Out of memory building SSH command.");
+        return;
+    }
+    run_ssh_to_file(state->username, state->ip, remote, temp_file);
+    free(remote);
 
     /* Read results from temp file */
     temp = fopen(temp_file, "r");
     if (!temp) {
+        unlink(temp_file);
         snprintf(state->status, sizeof(state->status), "Could not create file list (SSH may have failed).");
         return;
     }
@@ -712,25 +794,25 @@ static void pull_local_songs(const char *library_path, AppState *state,
  * each as an SSH source, de-duplicating by exact title/artist/album. */
 static void pull_ssh_songs(const char *library_path, AppState *state,
                            LibraryHandler **library, MusicRipper *ripper) {
-    char command[2048];
     char temp_file[256];
+    char *remote;
     char line[1024];
     FILE *list;
     int total = 0, added = 0;
 
     if (!state->username[0] || !state->ip[0]) { snprintf(state->status, sizeof(state->status), "Enter USERNAME and IP first."); return; }
+    if (!valid_ssh_name(state->username, 0) || !valid_ssh_name(state->ip, 1)) { snprintf(state->status, sizeof(state->status), "USERNAME/IP contains invalid characters."); return; }
     if (!state->path[0]) { snprintf(state->status, sizeof(state->status), "Enter a PATH directory to pull songs from."); return; }
-    snprintf(temp_file, sizeof(temp_file), "/tmp/leecher_pull_%ld.txt", (long)time(NULL));
-    if (snprintf(command, sizeof(command),
-        "ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
-        "'find \"%s\" -maxdepth 1 -type f \\( -iname \"*.mp3\" -o -iname \"*.flac\" -o -iname \"*.ogg\" -o -iname \"*.wav\" -o -iname \"*.m4a\" \\) 2>/dev/null | sort' > %s 2>&1",
-        state->username, state->ip, state->path, temp_file) >= (int)sizeof(command)) {
-        snprintf(state->status, sizeof(state->status), "SSH command too long.");
-        return;
-    }
-    system(command);
+    snprintf(temp_file, sizeof(temp_file), "/tmp/leecher_pull_XXXXXX");
+    int fd = mkstemp(temp_file);
+    if (fd < 0) { snprintf(state->status, sizeof(state->status), "Could not create temp file for SSH pull."); return; }
+    close(fd);
+    remote = remote_find_command(state->path);
+    if (!remote) { unlink(temp_file); snprintf(state->status, sizeof(state->status), "Out of memory building SSH command."); return; }
+    run_ssh_to_file(state->username, state->ip, remote, temp_file);
+    free(remote);
     list = fopen(temp_file, "r");
-    if (!list) { snprintf(state->status, sizeof(state->status), "Could not run SSH find."); return; }
+    if (!list) { unlink(temp_file); snprintf(state->status, sizeof(state->status), "Could not run SSH find."); return; }
     while (fgets(line, sizeof(line), list)) {
         char *path;
         LibrarySongQuery song;
