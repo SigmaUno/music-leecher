@@ -2,6 +2,7 @@
 set -eu
 
 config_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}
+install_dir=${LEECHER_INSTALL_DIR:-"$HOME/.local/lib/leecher"}
 plugin_destination=$config_dir/omarchy/plugins/leecher.media
 shell_config=$config_dir/omarchy/shell.json
 unit_destination=$config_dir/systemd/user/leecher-headless.service
@@ -35,8 +36,18 @@ elif [ -d "$plugin_destination" ]; then
     printf 'Left %s in place because it contains files not managed by this installer.\n' "$plugin_destination"
 fi
 
+# --- Remove the installed backend (binaries, default library) --------------
+if [ -d "$install_dir" ]; then
+    printf 'Removing installed backend at %s...\n' "$install_dir"
+    rm -rf "$install_dir"
+fi
+
+# --- Clean runtime IPC state left under /tmp (see Issue #20) ----------------
+rm -f /tmp/leecher-status.json /tmp/leecher-control /tmp/leecher-cover.jpg
+rm -f /tmp/leecher-cover-*.jpg
+
 if command -v omarchy-shell >/dev/null 2>&1; then
     omarchy-shell shell rescanPlugins || true
 fi
 
-printf '%s\n' 'Leecher Omarchy integration uninstalled.'
+printf '%s\n' 'Leecher uninstalled.'

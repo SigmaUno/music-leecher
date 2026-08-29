@@ -9,8 +9,10 @@ Wants=pipewire.service pipewire-pulse.service wireplumber.service
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Work/leecher-music-player
-ExecStart=%h/Work/leecher-music-player/app --headless %h/Work/leecher-music-player/library.json
+# WorkingDirectory/ExecStart paths are set by install.sh from the real install
+# location. They are never the source checkout.
+WorkingDirectory=__LEECHER_DIR__
+ExecStart=__LEECHER_DIR__/app --headless __LEECHER_DIR__/library.json
 Restart=on-failure
 RestartSec=2
 

@@ -1,15 +1,57 @@
 # Omarchy integration
 
-`plugin/leecher.media/` is the Leecher bar widget. Copy or symlink that
-directory to `~/.config/omarchy/plugins/leecher.media/`.
+`plugin/leecher.media/` is the Leecher bar widget, installed to
+`~/.config/omarchy/plugins/leecher.media/`. `shell.json` records the current
+Omarchy bar layout, including the `leecher.media` entry.
 
-`shell.json` records the current Omarchy bar layout, including the
-`leecher.media` entry. `systemd/leecher-headless.service` starts the widget's
-headless backend with the user session.
+## Installing
 
-Run `./omarchy/install.sh` from the repository to build the backend, install
-the plugin, add the bar entry when needed, and enable the user service. The
-installer backs up an existing `shell.json` before changing it.
+```sh
+./omarchy/install.sh
+```
 
-Run `./omarchy/uninstall.sh` to disable and remove the Leecher service and
-widget. It also removes the bar entry after backing up `shell.json`.
+The installer:
+
+- checks runtime dependencies up front (`ssh`, `ssh-agent`, `curl`, `ffmpeg`,
+  `jq`; warns if `zenity` is missing);
+- copies the backend binaries into a stable location,
+  `~/.local/lib/leecher/` — never the source checkout;
+- writes a default `library.json` if none exists;
+- installs the widget and adds `leecher.media` to the bar (backing up an
+  existing `shell.json`);
+- generates `omarchy/systemd/leecher-headless.service` with the real install
+  path and enables the `leecher-headless.service` user unit.
+
+### Confirmation
+
+- On an Omarchy system it asks a simple `[Y/n]`.
+- On any other system it warns that the widget targets Omarchy (so only the
+  headless backend will be installed) and requires you to type `im sure` to
+  continue.
+
+### Installing without building
+
+From a source checkout the installer builds the backend (`make`) when no
+prebuilt binaries are present, which needs SDL2 and libsndfile. To avoid
+building, create a self-contained release bundle:
+
+```sh
+./release.sh
+# -> dist/leecher-<version>.tar.gz
+```
+
+Unzip it and run the bundled `omarchy/install.sh` — it uses the shipped
+prebuilt `app` and `library-handler` directly.
+
+## Uninstalling
+
+```sh
+./omarchy/uninstall.sh
+```
+
+Removes the widget and bar entry (after backing up `shell.json`), disables and
+removes the user service, deletes the installed backend at
+`~/.local/lib/leecher/`, and cleans the runtime `/tmp` IPC state
+(`leecher-status.json`, `leecher-control`, `leecher-cover*.jpg`).
+
+The single systemd template lives at `omarchy/systemd/leecher-headless.service`.

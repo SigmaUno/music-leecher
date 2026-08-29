@@ -145,9 +145,16 @@ See [omarchy/README.md](omarchy/README.md). In short:
 ./app --headless /absolute/path/to/library.json
 ```
 
-plus `./omarchy/install.sh` to build, install the `leecher.media` bar widget,
-add it to `shell.json`, and enable the `leecher-headless.service` user unit —
-or `./omarchy/uninstall.sh` to remove it.
+`./omarchy/install.sh` installs the `leecher.media` bar widget, adds it to
+`shell.json`, copies the backend binaries to `~/.local/lib/leecher/`, and
+enables the `leecher-headless.service` user unit — or `./omarchy/uninstall.sh`
+removes it (including the runtime `/tmp` IPC state).
+
+To install without building (no SDL2/libsndfile needed), build a release bundle
+with `./release.sh` and unzip it: the bundled `omarchy/install.sh` uses the
+prebuilt binaries directly. The installer checks runtime dependencies up front
+and, when run on a non-Omarchy system, warns that the widget needs Omarchy and
+asks for confirmation (`im sure`).
 
 ## Testing
 

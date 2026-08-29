@@ -5,3 +5,4 @@ test-assembler
 test-library-mutation
 test-decoder
 app
+dist/
