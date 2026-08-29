@@ -10,7 +10,7 @@ Wants=pipewire.service pipewire-pulse.service wireplumber.service
 [Service]
 Type=simple
 WorkingDirectory=%h/Work/leecher-music-player
-ExecStart=%h/Work/leecher-music-player/app --headless %h/Work/leecher-music-player/library.example.json
+ExecStart=%h/Work/leecher-music-player/app --headless %h/Work/leecher-music-player/library.json
 Restart=on-failure
 RestartSec=2
 

@@ -18,6 +18,12 @@ command -v jq >/dev/null 2>&1 || {
 printf '%s\n' 'Building Leecher Music Player…'
 make -C "$project_dir" app
 
+printf '%s\n' 'Creating default library if missing…'
+if [ ! -f "$project_dir/library.json" ]; then
+    printf '%s\n' '{"version":1,"tracks":[]}' > "$project_dir/library.json"
+    printf '%s\n' 'Created an empty library at library.json.'
+fi
+
 printf '%s\n' 'Installing Omarchy widget…'
 install -d "$plugin_destination"
 install -m 0644 "$plugin_source/manifest.json" "$plugin_destination/manifest.json"

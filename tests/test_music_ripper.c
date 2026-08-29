@@ -22,7 +22,7 @@ static int fetch_https(const LibrarySource *source, MusicRipperWriteFn write, vo
 int main(void) {
     char error[128] = {0};
     char output[6] = {0};
-    LibraryHandler *library = library_handler_open("library.example.json", error, sizeof(error));
+    LibraryHandler *library = library_handler_open("tests/library.fixture.json", error, sizeof(error));
     LibrarySongQuery query = { .title = "Teardrop", .artist = "Massive Attack" };
     LibrarySourceKind https = LIBRARY_SOURCE_HTTPS;
     MusicRipper ripper;

@@ -49,7 +49,7 @@ resolving/mutating library JSON (used by the test scripts).
 ## Usage
 
 ```sh
-./app                          # GUI, library.example.json
+./app                          # GUI, default library.json
 ./app my-library.json          # GUI with a custom library
 ./app --headless my-library.json  # no window, Omarchy backend
 ```
@@ -84,7 +84,7 @@ set_title 3 …   set_artist 3 …   set_album 3 …   remove 4
 
 ## Library format
 
-`library.example.json` shows the schema:
+`library.json` (created by `omarchy/install.sh` when missing) shows the schema:
 
 ```json
 {

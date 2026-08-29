@@ -1546,8 +1546,8 @@ static void apply_theme(struct nk_context *ctx, const ThemePalette *p, struct nk
 
 int main(int argc, char **argv) {
     int headless = argc > 1 && !strcmp(argv[1], "--headless");
-    const char *library_path = headless ? (argc > 2 ? argv[2] : "library.example.json")
-                                        : (argc > 1 ? argv[1] : "library.example.json");
+    const char *library_path = headless ? (argc > 2 ? argv[2] : "library.json")
+                                        : (argc > 1 ? argv[1] : "library.json");
     char error[256] = {0};
     LibraryHandler *library = library_handler_open(library_path, error, sizeof(error));
     MusicRipper ripper = {0};
