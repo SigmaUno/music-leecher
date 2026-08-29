@@ -27,10 +27,13 @@ static void set_error(char *error, size_t error_size, const char *format, ...) {
 }
 
 static void trim_string(char *str) {
+    char *start, *end;
+    size_t leading;
     if (!str || !*str) return;
-    char *end;
-    while (*str && isspace((unsigned char)*str)) str++;
-    memmove(str, str, strlen(str) + 1);
+    start = str;
+    while (*start && isspace((unsigned char)*start)) start++;
+    leading = (size_t)(start - str);
+    if (leading) memmove(str, start, strlen(start) + 1);
     if (!*str) return;
     end = str + strlen(str) - 1;
     while (end > str && isspace((unsigned char)*end)) *end-- = '\0';
