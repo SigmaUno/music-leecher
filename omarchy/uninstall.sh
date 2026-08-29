@@ -42,7 +42,10 @@ if [ -d "$install_dir" ]; then
     rm -rf "$install_dir"
 fi
 
-# --- Clean runtime IPC state left under /tmp (see Issue #20) ----------------
+# --- Clean runtime IPC state (per-user dirs; see Issue #20/#12) ---------------
+rm -rf "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/leecher}"
+rm -rf "/tmp/leecher-$UID"
+# --- Remove the legacy world-readable /tmp IPC files, if any -----------------
 rm -f /tmp/leecher-status.json /tmp/leecher-control /tmp/leecher-cover.jpg
 rm -f /tmp/leecher-cover-*.jpg
 

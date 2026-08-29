@@ -50,8 +50,8 @@ typedef struct {
     size_t selected_track;
     SDL_AudioDeviceID audio_device;
     pid_t ssh_agent_pid;
-    char ssh_agent_dir[64];
-    char ssh_agent_socket[96];
+    char ssh_agent_dir[PATH_MAX];
+    char ssh_agent_socket[PATH_MAX];
     int is_playing;
     Uint32 position_ms;
     Uint32 last_position_ms;
@@ -92,9 +92,68 @@ typedef struct {
     int autoplay_advancing;
 } AppState;
 
-#define STATUS_FILE "/tmp/leecher-status.json"
-#define CONTROL_FILE "/tmp/leecher-control"
-#define COVER_FILE  "/tmp/leecher-cover.jpg"
+/* Per-user private IPC directory.  All status / control / cover / ssh-agent
+ * files live here so that a multi-user host cannot read or clobber another
+ * user's state through the old world-predictable /tmp paths.  Prefer
+ * $XDG_RUNTIME_DIR (0700, owned by us) and fall back to a 0700 dir in /tmp
+ * keyed by uid when it is unset (e.g. some headless launches). */
+/* IPC paths are bounded and short: XDG_RUNTIME_DIR is at most a few dozen
+ * bytes plus our fixed subdirectory, so 320 comfortably fits every consumer
+ * buffer (the 512-byte cover/save buffers, PATH_MAX ssh-agent buffers, etc.). */
+#define IPC_PATH_MAX 320
+static char ipc_dir[IPC_PATH_MAX];
+static char status_file[IPC_PATH_MAX];
+static char control_file[IPC_PATH_MAX];
+static char cover_file[IPC_PATH_MAX];
+
+static const char *ipc_path(char *buf, size_t size, const char *name) {
+    const char *const dir = ipc_dir;
+    snprintf(buf, size, "%s/%s", dir, name);
+    return buf;
+}
+
+static void init_ipc_dir(void) {
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    struct stat st;
+    char fallback[IPC_PATH_MAX];
+
+    fallback[0] = '\0';
+    if (runtime && runtime[0]) {
+        const char *const base = runtime;
+        snprintf(ipc_dir, sizeof(ipc_dir), "%s/leecher", base);
+    } else {
+        snprintf(ipc_dir, sizeof(ipc_dir), "/tmp/leecher-%lu", (unsigned long)getuid());
+    }
+
+    snprintf(fallback, sizeof(fallback), "/tmp/leecher-%lu-XXXXXX", (unsigned long)getuid());
+
+    if (mkdir(ipc_dir, 0700) == 0) {
+        /* Pre-existing directory owned by another user (or a symlink to one)
+         * must never be trusted: fall back to a uniquely-named directory. */
+        if (lstat(ipc_dir, &st) != 0 ||
+            !S_ISDIR(st.st_mode) ||
+            st.st_uid != getuid() ||
+            (st.st_mode & 077) != 0) {
+            if (mkdtemp(fallback)) {
+                const char *const dir = fallback;
+                snprintf(ipc_dir, sizeof(ipc_dir), "%s", dir);
+            }
+            else ipc_dir[0] = '\0';
+        }
+    } else if (errno != EEXIST || lstat(ipc_dir, &st) != 0 ||
+               !S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
+               (st.st_mode & 077) != 0) {
+        if (mkdtemp(fallback)) {
+            const char *const dir = fallback;
+            snprintf(ipc_dir, sizeof(ipc_dir), "%s", dir);
+        }
+        else { perror("leecher: cannot create IPC directory"); ipc_dir[0] = '\0'; }
+    }
+
+    ipc_path(status_file, sizeof(status_file), "status.json");
+    ipc_path(control_file, sizeof(control_file), "control");
+    ipc_path(cover_file, sizeof(cover_file), "cover.jpg");
+}
 
 static volatile sig_atomic_t stop_requested;
 
@@ -135,8 +194,9 @@ static void write_status(const AppState *state) {
     char *title = json_escape(state->title), *artist = json_escape(state->artist),
          *album = json_escape(state->album), *library = json_escape(state->library_path),
          *cover = json_escape(state->cover_file[0] ? state->cover_file : NULL);
-    FILE *file = fopen(STATUS_FILE, "w");
+    FILE *file = fopen(status_file, "w");
     if (!file) { free(title); free(artist); free(album); free(library); free(cover); return; }
+    if (fchmod(fileno(file), 0600) < 0) { /* best-effort; dir is already 0700 */ }
     fprintf(file, "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
                   "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,\"cover\":\"%s\"}\n",
             title ? title : "", artist ? artist : "", album ? album : "",
@@ -169,16 +229,17 @@ static void launch_credential_agent(const char *program, AppState *state, const 
 }
 
 static int start_ssh_agent(AppState *state) {
-    char directory[] = "/tmp/leecher-ssh-agent-XXXXXX";
     pid_t pid;
     int attempt;
 
-    if (!mkdtemp(directory)) {
+    if (!state->ssh_agent_dir[0])
+        snprintf(state->ssh_agent_dir, sizeof(state->ssh_agent_dir), "%s/ssh-agent", ipc_dir);
+    if (mkdir(state->ssh_agent_dir, 0700) != 0 && errno != EEXIST) {
         snprintf(state->status, sizeof(state->status), "Could not create a private directory for the SSH agent.");
+        state->ssh_agent_dir[0] = '\0';
         return 0;
     }
-    snprintf(state->ssh_agent_dir, sizeof(state->ssh_agent_dir), "%s", directory);
-    snprintf(state->ssh_agent_socket, sizeof(state->ssh_agent_socket), "%s/socket", directory);
+    snprintf(state->ssh_agent_socket, sizeof(state->ssh_agent_socket), "%s/socket", state->ssh_agent_dir);
     pid = fork();
     if (pid == 0) {
         int null_fd = open("/dev/null", O_WRONLY);
@@ -934,25 +995,32 @@ static int run_command_timeout(const char *cmd, int timeout_ms) {
 }
 
 /* Runs ffmpeg to pull the first attached-picture (cover) from `input` (an
- * already shell-quoted ffmpeg input argument) into COVER_FILE, writing the
- * resulting path into `out` (cleared when no attached picture is found). */
+ * already shell-quoted ffmpeg input argument) into the per-user cover file,
+ * writing the resulting path into `out` (cleared when no attached picture is
+ * found). */
 static void run_ffmpeg_cover(const char *input, char *out, size_t out_size, int timeout_ms) {
     char command[3600];
+    char *qcover;
     struct stat st;
     out[0] = '\0';
+    qcover = shell_quote_words(cover_file);
+    if (!qcover) return;
     if (snprintf(command, sizeof(command),
-                 "ffmpeg -v error -y -i %s -an -map 0:v:0 -c:v copy -frames:v 1 '" COVER_FILE "' 2>/dev/null",
-                 input) >= (int)sizeof(command))
+                 "ffmpeg -v error -y -i %s -an -map 0:v:0 -c:v copy -frames:v 1 %s 2>/dev/null",
+                 input, qcover) >= (int)sizeof(command)) {
+        free(qcover);
         return;
-    if (run_command_timeout(command, timeout_ms) == 0 && stat(COVER_FILE, &st) == 0 && st.st_size > 0)
-        snprintf(out, out_size, "%s", COVER_FILE);
+    }
+    free(qcover);
+    if (run_command_timeout(command, timeout_ms) == 0 && stat(cover_file, &st) == 0 && st.st_size > 0)
+        snprintf(out, out_size, "%s", cover_file);
 }
 
-/* Extracts embedded album art from any supported source kind into COVER_FILE
- * using ffmpeg, and writes its path into `out` (cleared when there is no
- * embedded art). Local files and HTTPS URLs are passed straight to ffmpeg;
- * SSH/network files are streamed over ssh to ffmpeg's stdin so only the tiny
- * cover frame is transferred, not the whole track. */
+/* Extracts embedded album art from any supported source kind into the per-user
+ * cover file using ffmpeg, and writes its path into `out` (cleared when there
+ * is no embedded art). Local files and HTTPS URLs are passed straight to
+ * ffmpeg; SSH/network files are streamed over ssh to ffmpeg's stdin so only
+ * the tiny cover frame is transferred, not the whole track. */
 static void extract_source_cover(const LibrarySource *source, char *out, size_t out_size) {
     out[0] = '\0';
     if (!source) return;
@@ -985,16 +1053,18 @@ static void extract_source_cover(const LibrarySource *source, char *out, size_t 
         free(remote_cmd);
         if (!qcmd) return;
         char command[3600];
-        if (snprintf(command, sizeof(command),
-                     "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR -- %s@%s %s 2>/dev/null | ffmpeg -v error -y -i - -an -map 0:v:0 -c:v copy -frames:v 1 '" COVER_FILE "' 2>/dev/null",
-                     source->username, source->ip, qcmd) >= (int)sizeof(command)) {
-            free(qcmd);
-            return;
-        }
+        char *qcover = shell_quote_words(cover_file);
+        if (!qcover) { free(qcmd); return; }
+        int wrote = snprintf(command, sizeof(command),
+                     "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR -- %s@%s %s 2>/dev/null | ffmpeg -v error -y -i - -an -map 0:v:0 -c:v copy -frames:v 1 %s 2>/dev/null",
+                     source->username, source->ip, qcmd, qcover);
         free(qcmd);
+        free(qcover);
+        if (wrote >= (int)sizeof(command))
+            return;
         struct stat st;
-        if (run_command_timeout(command, 8000) == 0 && stat(COVER_FILE, &st) == 0 && st.st_size > 0)
-            snprintf(out, out_size, "%s", COVER_FILE);
+        if (run_command_timeout(command, 8000) == 0 && stat(cover_file, &st) == 0 && st.st_size > 0)
+            snprintf(out, out_size, "%s", cover_file);
         break;
     }
     default:
@@ -1021,8 +1091,9 @@ static void *fetch_worker(void *arg) {
             extract_source_cover(&track.sources[ci], save_cover, sizeof(save_cover));
         }
         if (save_cover[0]) {
-            char unique[512];
-            snprintf(unique, sizeof(unique), "/tmp/leecher-cover-%zu.jpg", job->index);
+            char unique[420];
+            const char *const dir = ipc_dir;
+            snprintf(unique, sizeof(unique), "%s/cover-%zu.jpg", dir, job->index);
             rename(save_cover, unique);
             snprintf(save_cover, sizeof(save_cover), "%s", unique);
         }
@@ -1345,15 +1416,26 @@ static void handle_control(const char *command, LibraryHandler **library, MusicR
 
 static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
                          Assembler *assembler, AppState *state, const char *library_path) {
-    FILE *file = fopen(CONTROL_FILE, "r");
+    struct stat st;
+    int fd = open(control_file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    FILE *file;
     char line[512];
-    if (!file) return;
+    if (fd < 0) return;
+    /* Only accept a control file we own and that is a regular file; reject
+     * symlinks and attacker-owned files outright. */
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) {
+        close(fd);
+        unlink(control_file);
+        return;
+    }
+    file = fdopen(fd, "r");
+    if (!file) { close(fd); unlink(control_file); return; }
     if (fgets(line, sizeof(line), file)) {
         line[strcspn(line, "\r\n")] = '\0';
         handle_control(line, library, (MusicRipper *)ripper, assembler, state, library_path);
     }
     fclose(file);
-    unlink(CONTROL_FILE);
+    unlink(control_file);
     write_status(state);
     (void)0;
 }
@@ -1647,6 +1729,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, request_stop);
     signal(SIGTERM, request_stop);
     pthread_mutex_init(&state.fetch_mutex, NULL);
+    init_ipc_dir();
     {
         char absolute[PATH_MAX];
         if (realpath(library_path, absolute)) snprintf(state.library_path, sizeof(state.library_path), "%.*s", (int)sizeof(state.library_path) - 1, absolute);

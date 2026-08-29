@@ -51,7 +51,8 @@ prebuilt `app` and `library-handler` directly.
 
 Removes the widget and bar entry (after backing up `shell.json`), disables and
 removes the user service, deletes the installed backend at
-`~/.local/lib/leecher/`, and cleans the runtime `/tmp` IPC state
-(`leecher-status.json`, `leecher-control`, `leecher-cover*.jpg`).
+`~/.local/lib/leecher/`, and cleans the per-user runtime IPC state
+(`$XDG_RUNTIME_DIR/leecher`, or `/tmp/leecher-<uid>`) plus any legacy `/tmp`
+files.
 
 The single systemd template lives at `omarchy/systemd/leecher-headless.service`.

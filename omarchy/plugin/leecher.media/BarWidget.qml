@@ -9,8 +9,12 @@ BarWidget {
     id: root
     moduleName: "leecher.media"
 
-    readonly property string statusFile: "/tmp/leecher-status.json"
-    readonly property string controlFile: "/tmp/leecher-control"
+    /* IPC directory shared with the backend.  These are shell fragments that
+     * the `sh -c` polls below expand at runtime, mirroring app.c's
+     * init_ipc_dir(): $XDG_RUNTIME_DIR/leecher, else /tmp/leecher-<uid>. */
+    readonly property string ipcDirShell: "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/leecher}${XDG_RUNTIME_DIR:-/tmp/leecher-$UID}"
+    readonly property string statusFile: ipcDirShell + "/status.json"
+    readonly property string controlFile: ipcDirShell + "/control"
 
     property string title: ""
     property string artist: ""

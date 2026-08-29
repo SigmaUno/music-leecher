@@ -23,9 +23,10 @@ manages the library, while a headless backend drives an Omarchy bar widget.
   `ffprobe`) auto-fills title/artist/album.
 - Push-and-pull library scraping: import local directories, drag-and-drop audio
   files into the window, or pull every unique song under a local/SSH path.
-- Headless mode writes state to `/tmp/leecher-status.json`, reads control
-  commands from `/tmp/leecher-control`, and renders covers to
-  `/tmp/leecher-cover.jpg`.
+- Headless mode writes state to `status.json`, reads control commands from
+  `control`, and renders covers to `cover*.jpg` — all under a per-user private
+  IPC directory (`$XDG_RUNTIME_DIR/leecher`, or `/tmp/leecher-<uid>` when the
+  runtime dir is unset) so no other local user can read or clobber your state.
 
 ## Building
 
@@ -64,17 +65,23 @@ widget protocol described below.
 
 ### Control protocol
 
-Headless state is a JSON object written to `/tmp/leecher-status.json`:
+Headless state is a JSON object written to `status.json` in the per-user IPC
+directory (`$XDG_RUNTIME_DIR/leecher`, or `/tmp/leecher-<uid>` when unset), e.g.
+for a user with `$XDG_RUNTIME_DIR=/run/user/1000`:
 
 ```json
 {"title":"Airbag","artist":"Radiohead","album":"OK Computer",
  "position_ms":12000,"duration_ms":232000,"is_playing":true,
  "track_index":1,"library":"/abs/path/library.json","autoplay":true,
- "cover":"/tmp/leecher-cover-1.jpg"}
+ "cover":"/run/user/1000/leecher/cover-1.jpg"}
 ```
 
-Drop a single command line into `/tmp/leecher-control` and it is consumed on
-the next frame:
+The directory (and its status file) are created `0700`/`0600`, so only the
+owner can read them. The backend refuses to follow symlinks or accept
+attacker-owned control files.
+
+Drop a single command line into the `control` file in the same directory and it
+is consumed on the next frame:
 
 ```
 play_pause      play 16          next            previous
@@ -148,7 +155,7 @@ See [omarchy/README.md](omarchy/README.md). In short:
 `./omarchy/install.sh` installs the `leecher.media` bar widget, adds it to
 `shell.json`, copies the backend binaries to `~/.local/lib/leecher/`, and
 enables the `leecher-headless.service` user unit — or `./omarchy/uninstall.sh`
-removes it (including the runtime `/tmp` IPC state).
+removes it (including the runtime per-user IPC state).
 
 To install without building (no SDL2/libsndfile needed), build a release bundle
 with `./release.sh` and unzip it: the bundled `omarchy/install.sh` uses the
