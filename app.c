@@ -90,6 +90,10 @@ typedef struct {
     int autoplay_advancing;
 } AppState;
 
+/* Joins any in-flight background fetch thread before the library handler it
+ * was given can be freed out from under it (see cancel_fetch's definition). */
+static void cancel_fetch(AppState *s);
+
 /* Per-user private IPC directory.  All status / control / cover / ssh-agent
  * files live here so that a multi-user host cannot read or clobber another
  * user's state through the old world-predictable /tmp paths.  Prefer
@@ -465,7 +469,7 @@ static int run_ssh_to_file(const char *username, const char *ip,
     pid = fork();
     if (pid == 0) {
         char *const arguments[] = { "ssh", "-F", "/dev/null", "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=5",
             "--", target, (char *)remote_command, NULL };
         if (dup2(fd, STDOUT_FILENO) < 0) _exit(127);
         if (dup2(fd, STDERR_FILENO) < 0) _exit(127);
@@ -856,6 +860,7 @@ static int import_single_source(const char *library_path, AppState *state,
     }
     LibraryHandler *reloaded = library_handler_open(library_path, error, sizeof(error));
     if (reloaded) {
+        cancel_fetch(state);
         library_handler_close(*library);
         *library = reloaded;
         if (ripper) ripper->library = reloaded;
@@ -1466,7 +1471,7 @@ static void handle_set_field(LibraryHandler **library, MusicRipper *ripper, cons
     }
     {
         LibraryHandler *reloaded = library_handler_open(library_path, reload, sizeof(reload));
-        if (reloaded) { library_handler_close(*library); *library = reloaded; ripper->library = reloaded; }
+        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; }
         else snprintf(state->status, sizeof(state->status), "Updated, but reload failed: %s", reload);
     }
     snprintf(state->status, sizeof(state->status), "Updated %s for track %zu.", key, idx);
@@ -1485,7 +1490,7 @@ static void handle_remove_track(LibraryHandler **library, MusicRipper *ripper, c
     {
         char reload[256] = {0};
         LibraryHandler *reloaded = library_handler_open(library_path, reload, sizeof(reload));
-        if (reloaded) { library_handler_close(*library); *library = reloaded; ripper->library = reloaded; }
+        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; }
         else snprintf(state->status, sizeof(state->status), "Removed, but reload failed: %s", reload);
     }
     if (idx == state->selected_track) {
@@ -1555,7 +1560,7 @@ static void handle_set_fields(LibraryHandler **library, MusicRipper *ripper,
     }
     {
         LibraryHandler *reloaded = library_handler_open(library_path, reload, sizeof(reload));
-        if (reloaded) { library_handler_close(*library); *library = reloaded; ripper->library = reloaded; }
+        if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; }
         else snprintf(state->status, sizeof(state->status), "Updated, but reload failed: %s", reload);
     }
     snprintf(state->status, sizeof(state->status), "Updated track %zu.", idx);
@@ -1710,7 +1715,7 @@ static void draw_scraper(struct nk_context *ctx, AppState *state, LibraryHandler
         char error[256] = {0};
         if (library_handler_add_source(library_path, &song, &source, error, sizeof(error)) == 1) {
             LibraryHandler *reloaded = library_handler_open(library_path, error, sizeof(error));
-            if (reloaded) { library_handler_close(*library); *library = reloaded; ripper->library = reloaded; snprintf(state->status, sizeof(state->status), "%s source saved to the library.", method_name(state->method)); }
+            if (reloaded) { cancel_fetch(state); library_handler_close(*library); *library = reloaded; ripper->library = reloaded; snprintf(state->status, sizeof(state->status), "%s source saved to the library.", method_name(state->method)); }
             else snprintf(state->status, sizeof(state->status), "Saved source, but reload failed: %s", error);
         } else snprintf(state->status, sizeof(state->status), "%s", error);
     }
