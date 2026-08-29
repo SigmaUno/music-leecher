@@ -4,5 +4,6 @@ test-music-ripper
 test-assembler
 test-library-mutation
 test-decoder
+test-metadata
 app
 dist/
