@@ -302,7 +302,9 @@ BarWidget {
 
     Process {
         id: statusProc
-        command: ["sh", "-c", "cat " + root.statusFile + " 2>/dev/null"]
+        /* Quote the status path so a $XDG_RUNTIME_DIR containing spaces or
+         * shell metacharacters cannot be split into extra argv words. */
+        command: ["sh", "-c", "cat \"" + root.statusFile + "\" 2>/dev/null"]
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: root.updateStatus(text)
@@ -926,7 +928,9 @@ BarWidget {
 
     Process {
         id: libraryProc
-        command: ["sh", "-c", "cat " + root.libraryPath + " 2>/dev/null"]
+        /* Pass libraryPath as a separate argv element ($1) so a path containing
+         * spaces, quotes, or shell metacharacters is never interpreted by sh. */
+        command: ["sh", "-c", "cat \"$1\" 2>/dev/null", "-", root.libraryPath]
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: root.setTracks(text)
