@@ -109,6 +109,17 @@ BarWidget {
          * resolves to a single redirection target. */
         Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + root.lastCommandId + " " + enc(cmd) + "' > \"" + root.controlFile + "\""]);
     }
+    /* Single-command multi-field edit: each value is percent-encoded with enc()
+     * (no literal spaces/quotes/newlines remain), so the three values are joined
+     * by literal spaces into one control line that the backend splits and
+     * applies in a single atomic library write. */
+    function sendControlFields(idx, f1, f2, f3) {
+        root.lastCommandId = (root.lastCommandId + 1) & 0x7fffffff;
+        root.pendingCommandId = root.lastCommandId;
+        root.commandAcked = false;
+        var values = enc(f1) + " " + enc(f2) + " " + enc(f3);
+        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + root.lastCommandId + " set_fields " + idx + " " + values + "' > \"" + root.controlFile + "\""]);
+    }
     function seekTo(ms) {
         root.sendControl("seek " + Math.round(ms));
     }
@@ -149,9 +160,8 @@ BarWidget {
     function saveEdit() {
         if (root.editIndex < 0)
             return;
-        root.sendControl("set_title " + root.editIndex + " " + root.editTitle);
-        root.sendControl("set_artist " + root.editIndex + " " + root.editArtist);
-        root.sendControl("set_album " + root.editIndex + " " + root.editAlbum);
+        /* Apply all three fields in one atomic backend write. */
+        root.sendControlFields(root.editIndex, root.editTitle, root.editArtist, root.editAlbum);
         root.editVisible = false;
         root.editIndex = -1;
         root.loadLibrary();
@@ -266,8 +276,7 @@ BarWidget {
     function loadLibrary() {
         if (root.libraryPath === "")
             return;
-        if (!libraryProc.running)
-            libraryProc.running = true;
+        libraryFileView.reload();
     }
     function setTracks(raw) {
         var tracksList = [];
@@ -925,14 +934,16 @@ BarWidget {
         }
     }
 
-    Process {
-        id: libraryProc
-        /* Pass libraryPath as a separate argv element ($1) so a path containing
-         * spaces, quotes, or shell metacharacters is never interpreted by sh. */
-        command: ["sh", "-c", "cat \"$1\" 2>/dev/null", "-", root.libraryPath]
-        stdout: StdioCollector {
-            waitForEnd: true
-            onStreamFinished: root.setTracks(text)
-        }
+    /* Watch the library file in-process (no `sh -c cat` fork).  watchChanges
+     * plus reload() means the list re-reads fresh content whenever the backend
+     * rewrites the file, so a remove/edit edit is reflected immediately instead
+     * of lingering from a stale snapshot read before the write landed. */
+    FileView {
+        id: libraryFileView
+        path: root.libraryPath
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: root.setTracks(text())
     }
 }

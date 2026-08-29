@@ -1516,10 +1516,56 @@ static void control_decode(char *out, size_t out_size, const char *in) {
     out[o] = '\0';
 }
 
+/* `set_fields <idx> <enc-title> <enc-artist> <enc-album>` from the widget's
+ * sendControlFields(): the three values are percent-encoded (enc()) so they
+ * contain no literal spaces; the tokens are separated by single spaces.  Decode
+ * each field and apply all three in ONE atomic library write, avoiding the old
+ * three separate set_* commands that could persist a half-applied edit. */
+static void handle_set_fields(LibraryHandler **library, MusicRipper *ripper,
+                              const char *library_path, AppState *state, const char *command) {
+    const char *p = command + strlen("set_fields ");
+    char *end;
+    size_t idx = (size_t)strtoul(p, &end, 10);
+    char error[256] = {0}, reload[256] = {0};
+    const char *fields[3] = { NULL, NULL, NULL };
+    char decoded[3][512];
+    int i = 0;
+    const char *tok = end;
+    if (end == p) { snprintf(state->status, sizeof(state->status), "Edit failed: missing track index."); return; }
+    while (i < 3 && *tok) {
+        const char *sp = tok;
+        size_t len;
+        while (*sp && *sp != ' ') sp++;
+        len = (size_t)(sp - tok);
+        if (len >= sizeof(decoded[i])) len = sizeof(decoded[i]) - 1;
+        memcpy(decoded[i], tok, len);
+        decoded[i][len] = '\0';
+        control_decode(decoded[i], sizeof(decoded[i]), decoded[i]);
+        fields[i] = decoded[i];
+        i++;
+        tok = (*sp == ' ') ? sp + 1 : sp;
+    }
+    /* Missing trailing fields keep their NULL (unchanged); explicit empty values
+     * are decoded to "" and will clear the field, as the widget always sends all
+     * three current values. */
+    if (library_handler_update_track(library_path, idx, fields[0], fields[1], fields[2],
+                                     error, sizeof(error)) != 1) {
+        snprintf(state->status, sizeof(state->status), "Edit failed: %s", error[0] ? error : "unknown error");
+        return;
+    }
+    {
+        LibraryHandler *reloaded = library_handler_open(library_path, reload, sizeof(reload));
+        if (reloaded) { library_handler_close(*library); *library = reloaded; ripper->library = reloaded; }
+        else snprintf(state->status, sizeof(state->status), "Updated, but reload failed: %s", reload);
+    }
+    snprintf(state->status, sizeof(state->status), "Updated track %zu.", idx);
+    write_status(state);
+}
+
 static void handle_control(const char *command, LibraryHandler **library, MusicRipper *ripper,
                            Assembler *assembler, AppState *state, const char *library_path) {
     /* Commands arrive as one line, e.g.: "play_pause", "next", "previous",
-     * "seek 45000", "play 16", "set_title 3 Radiohead", "remove 4",
+     * "seek 45000", "play 16", "set_fields 3 ...", "remove 4",
      * "autoplay on". Called from the main loop once per frame. */
     while (command && *command && (*command == ' ' || *command == '\t' || *command == '\n' || *command == '\r')) command++;
     if (!command || !*command) return;
@@ -1573,8 +1619,15 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
                 else id = 0;
             }
             if (id != 0) state->last_cmd_id = id;
-            control_decode(decoded, sizeof(decoded), cmd);
-            handle_control(decoded, library, (MusicRipper *)ripper, assembler, state, library_path);
+            /* set_fields carries three encoded fields that must be split on the
+             * still-encoded line (values may contain literal spaces after decode),
+             * so route it before the whole-line decode. */
+            if (strncmp(cmd, "set_fields ", 11) == 0) {
+                handle_set_fields(library, (MusicRipper *)ripper, library_path, state, cmd);
+            } else {
+                control_decode(decoded, sizeof(decoded), cmd);
+                handle_control(decoded, library, (MusicRipper *)ripper, assembler, state, library_path);
+            }
         }
     }
     fclose(file);
