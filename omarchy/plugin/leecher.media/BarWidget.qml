@@ -62,9 +62,13 @@ BarWidget {
 
     readonly property string playIcon: root.playing ? "\uf04c" : "\uf04b"
     readonly property bool effectiveHidden: root.hidden && !root.hoverPeek
+    /* A closed widget collapses to a restorable sliver instead of vanishing: if
+     * `visible` were disabled there would be no handle left to click and no way
+     * to bring it back short of re-configuration.  Closing also stops every
+     * timer and file watcher (see the `!root.closed` bindings below). */
+    readonly property bool collapsed: root.closed || root.effectiveHidden
 
-    visible: !root.closed
-    implicitWidth: root.effectiveHidden ? root.barSize : Style.space(24) + root.barSize + Style.space(6) + Style.space(150) + Style.space(18)
+    implicitWidth: root.collapsed ? root.barSize : Style.space(24) + root.barSize + Style.space(6) + Style.space(150) + Style.space(18)
     implicitHeight: root.barSize
 
     function now() {
@@ -193,6 +197,22 @@ BarWidget {
         root.editIndex = -1;
         root.pendingPlayIndex = -1;
     }
+    /* Closing drops the widget to a collapsed sliver and halts all background
+     * work (position timer + the two file watchers are bound to !closed); the
+     * context menu on the sliver offers "Open widget" to restore it. */
+    function setClosed(v) {
+        if (root.closed === v)
+            return;
+        root.closed = v;
+        if (v) {
+            root.close();
+            root.contextOpen = false;
+            root.hoverPeek = false;
+        } else {
+            root.refresh();
+            libraryFileView.reload();
+        }
+    }
     function refresh() {
         statusFileView.reload();
     }
@@ -301,7 +321,7 @@ BarWidget {
     Timer {
         id: posTimer
         interval: 500
-        running: true
+        running: !root.closed
         repeat: true
         onTriggered: root.clampPosition()
     }
@@ -313,7 +333,7 @@ BarWidget {
     FileView {
         id: statusFileView
         path: root.statusFile
-        watchChanges: true
+        watchChanges: !root.closed
         printErrors: false
         onFileChanged: reload()
         onLoaded: root.updateStatus(text())
@@ -323,16 +343,16 @@ BarWidget {
         id: row
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.leftMargin: root.effectiveHidden ? Style.space(12) : Style.space(24)
-        anchors.rightMargin: root.effectiveHidden ? 0 : Style.space(18)
+        anchors.leftMargin: root.collapsed ? Style.space(12) : Style.space(24)
+        anchors.rightMargin: root.collapsed ? 0 : Style.space(18)
         anchors.verticalCenter: parent.verticalCenter
-        spacing: root.effectiveHidden ? 0 : Style.space(6)
+        spacing: root.collapsed ? 0 : Style.space(6)
 
         Text {
             id: glyph
             anchors.verticalCenter: parent.verticalCenter
-            text: root.hasTrack ? root.playIcon : "\uf001"
-            color: root.hasTrack ? (root.playing ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.4)) : Qt.darker(root.bar.foreground, 1.5)
+            text: root.closed ? "\uf05e" : (root.hasTrack ? root.playIcon : "\uf001")
+            color: root.closed ? Qt.darker(root.bar.foreground, 1.7) : (root.hasTrack ? (root.playing ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.4)) : Qt.darker(root.bar.foreground, 1.5))
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.body
         }
@@ -342,6 +362,7 @@ BarWidget {
             z: 10
             cursorShape: Qt.PointingHandCursor
             hoverEnabled: true
+            enabled: !root.closed
             onClicked: {
                 if (root.hasTrack)
                     root.playPause();
@@ -351,7 +372,7 @@ BarWidget {
         Text {
             id: label
             anchors.verticalCenter: parent.verticalCenter
-            visible: !root.effectiveHidden
+            visible: !root.collapsed
             text: root.hasTrack ? (root.title + (root.artist !== "" ? "  \u00b7  " + root.artist : "")) : (root.statusText !== "" ? root.statusText : "Nothing's playing")
             color: root.hasTrack ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.4)
             font.family: root.bar.fontFamily
@@ -373,10 +394,14 @@ BarWidget {
         onClicked: function (mouse) {
             if (mouse.button === Qt.RightButton)
                 root.contextOpen = !root.contextOpen;
+            else if (root.closed)
+                root.contextOpen = true;
             else
                 root.popupOpen = true;
         }
         onEntered: {
+            if (root.closed)
+                return;
             if (root.hidden) {
                 root.hoverPeek = true;
                 peekTimer.restart();
@@ -919,16 +944,16 @@ BarWidget {
                 }
             }
             Button {
-                text: "Close widget"
+                text: root.closed ? "Open widget" : "Close widget"
                 width: parent.width
                 height: Style.space(34)
                 iconSize: Style.font.icon
-                foreground: Color.urgent
+                foreground: root.closed ? root.bar.foreground : Color.urgent
                 verticalPadding: 0
                 horizontalPadding: Style.spacing.controlPaddingX
                 onClicked: {
                     root.contextOpen = false;
-                    root.closed = true;
+                    root.setClosed(!root.closed);
                 }
             }
         }
@@ -941,7 +966,7 @@ BarWidget {
     FileView {
         id: libraryFileView
         path: root.libraryPath
-        watchChanges: true
+        watchChanges: !root.closed
         printErrors: false
         onFileChanged: reload()
         onLoaded: root.setTracks(text())
