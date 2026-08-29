@@ -1,6 +1,10 @@
 #include "assembler.h"
 #include "decoder.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 int main(void) {
     const unsigned char wav[] = {
         'R','I','F','F', 40,0,0,0, 'W','A','V','E', 'f','m','t',' ', 16,0,0,0,
@@ -9,12 +13,22 @@ int main(void) {
     };
     AssemblerConfig config = { .piece_size = 13 };
     Assembler *assembler = assembler_create(&config);
-    DecoderPcm pcm = {0};
+    DecoderSource *src = NULL;
+    short buf[2];
     char error[128] = {0};
-    int result;
+    long long got;
     if (!assembler || assembler_push(assembler, wav, sizeof(wav)) != 1) return 1;
-    result = decoder_decode_queue(assembler, &pcm, error, sizeof(error));
-    if (result != 1 || pcm.sample_rate != 8000 || pcm.channels != 1 || pcm.sample_count != 2 || pcm.samples[0] != 1 || pcm.samples[1] != -1) { decoder_pcm_destroy(&pcm); assembler_destroy(assembler); return 1; }
-    decoder_pcm_destroy(&pcm); assembler_destroy(assembler);
+    if (decoder_open(assembler, &src, error, sizeof(error)) != 1) { assembler_destroy(assembler); fprintf(stderr, "open: %s\n", error); return 1; }
+    if (decoder_rate(src) != 8000 || decoder_channels(src) != 1 || decoder_total_frames(src) != 2) { decoder_close(src); assembler_destroy(assembler); return 1; }
+    got = decoder_read_frames(src, buf, 1);
+    if (got != 1 || buf[0] != 1) { decoder_close(src); assembler_destroy(assembler); return 1; }
+    got = decoder_read_frames(src, buf, 4);
+    if (got != 1 || buf[0] != -1) { decoder_close(src); assembler_destroy(assembler); return 1; }
+    if (decoder_read_frames(src, buf, 2) != 0) { decoder_close(src); assembler_destroy(assembler); return 1; }
+    if (decoder_seek(src, 0) != 0) { decoder_close(src); assembler_destroy(assembler); return 1; }
+    got = decoder_read_frames(src, buf, 1);
+    if (got != 1 || buf[0] != 1) { decoder_close(src); assembler_destroy(assembler); return 1; }
+    decoder_close(src);
+    assembler_destroy(assembler);
     return 0;
 }

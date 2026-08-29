@@ -49,22 +49,23 @@ typedef struct {
     SourceMethod method;
     size_t selected_track;
     SDL_AudioDeviceID audio_device;
-    pid_t ssh_agent_pid;
-    char ssh_agent_dir[PATH_MAX];
-    char ssh_agent_socket[PATH_MAX];
+    DecoderSource *decoder;
+    Uint64 audio_queued_frame;
+    Uint64 audio_total_frames;
+    int audio_channels;
+    int audio_rate;
     int is_playing;
     Uint32 position_ms;
     Uint32 last_position_ms;
     int position_stalls;
     Uint32 last_audio_retry_ms;
     Uint32 duration_ms;
-    short *audio_samples;
-    size_t audio_total_frames;
-    int audio_channels;
-    int audio_rate;
-    Uint64 audio_tail_frame;
-    Uint32 audio_tail_bytes;
     int track_ended;
+    int stream_open;
+    int stream_eof;
+    pid_t ssh_agent_pid;
+    char ssh_agent_dir[PATH_MAX];
+    char ssh_agent_socket[PATH_MAX];
     char library_path[512];
     char cover_file[512];
     int autoplay;
@@ -76,11 +77,7 @@ typedef struct {
     size_t fetch_index;
     pthread_t fetch_thread;
     int fetch_thread_valid;
-    short *fetch_samples;
-    size_t fetch_total_frames;
-    int fetch_channels;
-    int fetch_rate;
-    Uint32 fetch_duration_ms;
+    DecoderSource *fetch_decoder;
     char fetch_title[128];
     char fetch_artist[128];
     char fetch_album[128];
@@ -924,11 +921,7 @@ static void fetch_lock(AppState *s) { pthread_mutex_lock(&s->fetch_mutex); }
 static void fetch_unlock(AppState *s) { pthread_mutex_unlock(&s->fetch_mutex); }
 
 static void free_fetch_cache(AppState *s) {
-    if (s->fetch_samples) { free(s->fetch_samples); s->fetch_samples = NULL; }
-    s->fetch_total_frames = 0;
-    s->fetch_channels = 0;
-    s->fetch_rate = 0;
-    s->fetch_duration_ms = 0;
+    if (s->fetch_decoder) { decoder_close(s->fetch_decoder); s->fetch_decoder = NULL; }
     s->fetch_title[0] = '\0';
     s->fetch_artist[0] = '\0';
     s->fetch_album[0] = '\0';
@@ -1091,7 +1084,7 @@ static void *fetch_worker(void *arg) {
     AppState *s = job->state;
     LibraryTrack track = {0};
     LibrarySongQuery song = {0};
-    DecoderPcm pcm = {0};
+    DecoderSource *decoder = NULL;
     char error[256] = {0};
     char save_title[128] = {0}, save_artist[128] = {0}, save_album[128] = {0};
     char save_cover[512] = {0};
@@ -1114,7 +1107,7 @@ static void *fetch_worker(void *arg) {
         if (!s->fetch_cancel &&
             music_ripper_play_next(&job->ripper, &song, NULL, assemble_audio, job->assembler, error, sizeof(error)) == 1 &&
             !s->fetch_cancel &&
-            decoder_decode_queue(job->assembler, &pcm, error, sizeof(error)) == 1 &&
+            decoder_open(job->assembler, &decoder, error, sizeof(error)) == 1 &&
             !s->fetch_cancel) {
             ready = 1;
         }
@@ -1123,18 +1116,15 @@ static void *fetch_worker(void *arg) {
     if (ready) {
         fetch_lock(s);
         free_fetch_cache(s);
-        s->fetch_samples = pcm.samples;
-        s->fetch_total_frames = pcm.channels > 0 ? pcm.sample_count / (size_t)pcm.channels : 0;
-        s->fetch_channels = pcm.channels;
-        s->fetch_rate = pcm.sample_rate;
-        s->fetch_duration_ms = (pcm.sample_rate > 0 && pcm.channels > 0)
-            ? (Uint32)((Uint64)(pcm.sample_count / (size_t)pcm.channels) * 1000u / (Uint32)pcm.sample_rate) : 0;
+        s->fetch_decoder = decoder;
         snprintf(s->fetch_title, sizeof(s->fetch_title), "%s", save_title);
         snprintf(s->fetch_artist, sizeof(s->fetch_artist), "%s", save_artist);
         snprintf(s->fetch_album, sizeof(s->fetch_album), "%s", save_album);
         snprintf(s->fetch_cover, sizeof(s->fetch_cover), "%s", save_cover);
         s->fetch_ready = 1;
         fetch_unlock(s);
+    } else {
+        if (decoder) decoder_close(decoder);
     }
     fetch_lock(s);
     s->fetch_active = 0;
@@ -1167,7 +1157,14 @@ static void start_fetch(const LibraryHandler *library, AppState *s, size_t index
     job->state = s;
     job->library = library;
     job->index = index;
-    job->assembler = assembler_create(NULL);
+    /* Bound the compressed stream buffered during a fetch: a stuck source that
+     * streams data forever must eventually fail instead of growing RAM without
+     * limit. The limit is generous so legitimate lossless files still fit. */
+    {
+        AssemblerConfig acfg = {0};
+        acfg.max_queued_bytes = (size_t)3 * 1024 * 1024 * 1024;
+        job->assembler = assembler_create(&acfg);
+    }
     if (!job->assembler) { free(job); fetch_lock(s); s->fetch_active = 0; fetch_unlock(s); return; }
     job->ripper.library = library;
     job->ripper.transports = s->transports;
@@ -1197,34 +1194,43 @@ static void cancel_fetch(AppState *s) {
     s->immediate_pending = 0;
 }
 
-/* Swap the fetched PCM into the SDL audio device and begin playback. */
+/* How much decoded PCM we keep queued ahead in SDL, in frames.  Keeping only a
+ * fraction of the track decoded at once bounds RAM regardless of length. */
+#define STREAM_QUEUE_FRAMES  (44100u / 4u)         /* ~0.25s per chunk */
+#define STREAM_QUEUE_TARGET  (44100u * 3u / 4u)    /* refill up to ~0.75s */
+
+static void stream_audio(AppState *s);
+
+/* Swap the fetched stream into the SDL audio device and start streaming it.
+ * Only a small rolling window is decoded at a time (see stream_audio), so the
+ * whole track is never materialised in RAM as PCM. */
 static void commit_fetch(AppState *s, size_t idx) {
     SDL_AudioSpec desired = {0}, obtained = {0};
-    short *samples = NULL;
-    size_t total_frames = 0;
+    DecoderSource *decoder = NULL;
     int channels = 0, rate = 0;
-    Uint32 duration = 0;
-    size_t bytes;
+    Uint64 total_frames = 0;
 
     fetch_lock(s);
-    if (!s->fetch_ready || s->fetch_index != idx || !s->fetch_samples) {
+    if (!s->fetch_ready || s->fetch_index != idx || !s->fetch_decoder) {
         fetch_unlock(s);
         snprintf(s->status, sizeof(s->status), "Track is not ready yet.");
         return;
     }
-    samples = s->fetch_samples;
-    total_frames = s->fetch_total_frames;
-    channels = s->fetch_channels;
-    rate = s->fetch_rate;
-    duration = s->fetch_duration_ms;
+    decoder = s->fetch_decoder;
+    total_frames = (Uint64)decoder_total_frames(decoder);
+    channels = decoder_channels(decoder);
+    rate = decoder_rate(decoder);
     snprintf(s->title, sizeof(s->title), "%s", s->fetch_title);
     snprintf(s->artist, sizeof(s->artist), "%s", s->fetch_artist);
     snprintf(s->album, sizeof(s->album), "%s", s->fetch_album);
     snprintf(s->cover_file, sizeof(s->cover_file), "%s", s->fetch_cover);
-    bytes = total_frames * (size_t)channels * sizeof(short);
-    s->fetch_samples = NULL;
+    s->fetch_decoder = NULL;
     free_fetch_cache(s);
     fetch_unlock(s);
+
+    if (s->decoder) decoder_close(s->decoder);
+    s->decoder = decoder;
+    s->audio_queued_frame = 0;
 
     if (s->audio_device) SDL_CloseAudioDevice(s->audio_device);
     s->audio_device = 0;
@@ -1232,30 +1238,29 @@ static void commit_fetch(AppState *s, size_t idx) {
         desired.freq = rate; desired.format = AUDIO_S16SYS; desired.channels = (Uint8)channels; desired.samples = 4096;
         s->audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
     }
-    if (!s->audio_device || total_frames == 0 || SDL_QueueAudio(s->audio_device, samples, (Uint32)bytes) != 0) {
+    if (!s->audio_device || total_frames == 0) {
         snprintf(s->status, sizeof(s->status), "SDL audio: %s", SDL_GetError());
         if (s->audio_device) { SDL_CloseAudioDevice(s->audio_device); s->audio_device = 0; }
-        free(samples);
+        decoder_close(s->decoder); s->decoder = NULL;
         s->is_playing = 0;
         write_status(s);
         return;
     }
-    if (s->audio_samples) free(s->audio_samples);
-    s->audio_samples = samples;
-    s->audio_total_frames = total_frames;
     s->audio_channels = channels;
     s->audio_rate = rate;
-    s->audio_tail_frame = 0;
-    s->audio_tail_bytes = (Uint32)bytes;
+    s->audio_total_frames = total_frames;
     s->track_ended = 0;
+    s->stream_open = 1;
+    s->stream_eof = 0;
     s->is_playing = 1;
     s->position_ms = 0;
-    s->duration_ms = duration;
+    s->duration_ms = (rate > 0) ? (Uint32)(total_frames * 1000u / (Uint64)rate) : 0;
     s->selected_track = idx;
     s->pending_valid = 0;
     s->immediate_pending = 0;
     SDL_PauseAudioDevice(s->audio_device, 0);
     snprintf(s->status, sizeof(s->status), "Playing %s.", s->title[0] ? s->title : "track");
+    stream_audio(s);
     write_status(s);
 }
 
@@ -1299,27 +1304,52 @@ static void toggle_play_pause(AppState *state) {
 static Uint32 playback_ms(const AppState *s) {
     if (!s->audio_device || !s->audio_rate || s->audio_channels <= 0) return s->position_ms;
     Uint32 queued = SDL_GetQueuedAudioSize(s->audio_device);
-    Uint32 consumed = (s->audio_tail_bytes > queued) ? s->audio_tail_bytes - queued : 0;
-    Uint64 frames = consumed / ((Uint32)s->audio_channels * 2u);
-    Uint64 frame = s->audio_tail_frame + frames;
+    Uint64 frames_in_queue = queued / ((Uint32)s->audio_channels * 2u);
+    Uint64 frame = (s->audio_queued_frame > frames_in_queue) ? s->audio_queued_frame - frames_in_queue : 0;
     return (Uint32)(frame * 1000u / (Uint64)s->audio_rate);
 }
 
+/* Decode and queue PCM into SDL on demand.  Called every main-loop iteration;
+ * it refills SDL's queue up to STREAM_QUEUE_TARGET frames and stops, so only a
+ * small rolling window of the track is ever decoded and held in memory instead
+ * of the full PCM (and full duplicated SDL copy) at once. */
+static void stream_audio(AppState *s) {
+    int channels;
+    Uint32 target_bytes, queued;
+    long long chunk_limit = STREAM_QUEUE_FRAMES;
+    short buf[STREAM_QUEUE_FRAMES * 8]; /* up to 8 interleaved channels */
+    if (!s->stream_open || !s->decoder || s->stream_eof) return;
+    channels = s->audio_channels;
+    if (!s->audio_device || channels <= 0 || channels > 8) return;
+    target_bytes = STREAM_QUEUE_TARGET * (Uint32)channels * 2u;
+    while (s->stream_open && !s->stream_eof) {
+        queued = SDL_GetQueuedAudioSize(s->audio_device);
+        if (queued >= target_bytes) break;
+        if (chunk_limit > STREAM_QUEUE_FRAMES) chunk_limit = STREAM_QUEUE_FRAMES;
+        long long got = decoder_read_frames(s->decoder, buf, chunk_limit);
+        if (got <= 0) { s->stream_eof = 1; break; }
+        if (SDL_QueueAudio(s->audio_device, buf, (Uint32)((size_t)got * (size_t)channels * sizeof(short))) != 0) {
+            s->stream_eof = 1;
+            break;
+        }
+        s->audio_queued_frame += (Uint64)got;
+    }
+}
+
 static void seek_ms(AppState *s, Uint32 ms) {
-    if (!s->audio_device || !s->audio_samples) { snprintf(s->status, sizeof(s->status), "No audio loaded to seek."); return; }
     Uint64 rate = (Uint64)s->audio_rate;
+    Uint64 frame;
+    if (!s->audio_device || !s->decoder) { snprintf(s->status, sizeof(s->status), "No audio loaded to seek."); return; }
     if (!rate) return;
-    Uint64 frame = (Uint64)ms * rate / 1000u;
+    frame = (Uint64)ms * rate / 1000u;
     if (frame > s->audio_total_frames) frame = s->audio_total_frames;
-    size_t offset = (size_t)frame * (size_t)s->audio_channels;
-    size_t remain_frames = s->audio_total_frames - frame;
+    if (decoder_seek(s->decoder, (long long)frame) < 0) return;
     SDL_ClearQueuedAudio(s->audio_device);
-    if (remain_frames > 0)
-        SDL_QueueAudio(s->audio_device, s->audio_samples + offset, (Uint32)(remain_frames * (size_t)s->audio_channels * sizeof(short)));
-    s->audio_tail_frame = frame;
-    s->audio_tail_bytes = (Uint32)(remain_frames * (size_t)s->audio_channels * sizeof(short));
-    s->position_ms = (Uint32)(frame * 1000u / rate);
+    s->audio_queued_frame = frame;
+    s->stream_eof = 0;
     s->track_ended = 0;
+    s->position_ms = (Uint32)(frame * 1000u / rate);
+    stream_audio(s);
     SDL_PauseAudioDevice(s->audio_device, s->is_playing ? 0 : 1);
     snprintf(s->status, sizeof(s->status), "Seeked to %u:%02u.", s->position_ms / 60000, (s->position_ms / 1000) % 60);
     write_status(s);
@@ -1329,27 +1359,30 @@ static void seek_ms(AppState *s, Uint32 ms) {
  * position advance). This happens when the backend starts before the
  * PulseAudio/PipeWire graph is ready: SDL_OpenAudioDevice may report success
  * but never create a working output stream, so the queued PCM is never
- * consumed and the player silently "plays" into nothing. Reopen the device
- * from the buffered samples so playback self-heals instead of running dead
- * until a manual restart. */
+ * consumed and the player silently "plays" into nothing. Reopen the device and
+ * re-stream from the current position so playback self-heals instead of
+ * running dead until a manual restart. */
 static void retry_audio_device(AppState *s) {
+    SDL_AudioSpec desired = {0}, obtained = {0};
+    Uint64 played;
     if (s->audio_device) SDL_CloseAudioDevice(s->audio_device);
     s->audio_device = 0;
-    if (!s->audio_samples || s->audio_channels <= 0 || s->audio_rate <= 0) {
+    if (!s->decoder || s->audio_channels <= 0 || s->audio_rate <= 0) {
         s->is_playing = 0;
         write_status(s);
         return;
     }
-    SDL_AudioSpec desired = {0}, obtained = {0};
     desired.freq = s->audio_rate; desired.format = AUDIO_S16SYS;
     desired.channels = (Uint8)s->audio_channels; desired.samples = 4096;
     s->audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
     if (!s->audio_device) { snprintf(s->status, sizeof(s->status), "SDL audio: %s", SDL_GetError()); s->is_playing = 0; write_status(s); return; }
-    size_t offset = (size_t)s->audio_tail_frame * (size_t)s->audio_channels;
-    size_t remain_frames = s->audio_total_frames - s->audio_tail_frame;
-    if (remain_frames > 0)
-        SDL_QueueAudio(s->audio_device, s->audio_samples + offset, (Uint32)(remain_frames * (size_t)s->audio_channels * sizeof(short)));
-    s->audio_tail_bytes = (Uint32)(remain_frames * (size_t)s->audio_channels * sizeof(short));
+    /* The prior queue was never drained; resume from where playback sat. */
+    played = s->audio_queued_frame;
+    if (decoder_seek(s->decoder, (long long)played) < 0) { decoder_seek(s->decoder, 0); played = 0; }
+    s->audio_queued_frame = played;
+    s->stream_eof = 0;
+    s->track_ended = 0;
+    stream_audio(s);
     SDL_PauseAudioDevice(s->audio_device, s->is_playing ? 0 : 1);
     snprintf(s->status, sizeof(s->status), "Restarted audio output.");
     write_status(s);
@@ -1803,6 +1836,9 @@ int main(int argc, char **argv) {
     while (running && !stop_requested) {
         poll_control(&library, &ripper, assembler, &state, library_path);
 
+        /* Keep SDL's audio queue refilled from the decoder's rolling window. */
+        stream_audio(&state);
+
         /* Fulfil an immediate track request as soon as its fetch is ready. */
         if (state.immediate_pending) {
             fetch_lock(&state);
@@ -1947,7 +1983,7 @@ int main(int argc, char **argv) {
     }
     cancel_fetch(&state);
     if (state.audio_device) SDL_CloseAudioDevice(state.audio_device);
-    if (state.audio_samples) free(state.audio_samples);
+    if (state.decoder) { decoder_close(state.decoder); state.decoder = NULL; }
     pthread_mutex_destroy(&state.fetch_mutex);
     stop_ssh_agent(&state);
     if (!headless) { nk_sdl_shutdown(); SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); }

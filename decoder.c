@@ -9,6 +9,15 @@
 
 typedef struct { const unsigned char *data; sf_count_t size; sf_count_t offset; } MemoryAudio;
 
+struct DecoderSource {
+    unsigned char *bytes;
+    sf_count_t size;
+    MemoryAudio audio;
+    SF_INFO info;
+    SNDFILE *file;
+    sf_count_t frame;
+};
+
 static void set_error(char *error, size_t error_size, const char *format, ...) {
     va_list arguments;
     if (!error || !error_size) return;
@@ -29,22 +38,14 @@ static sf_count_t memory_read(void *destination, sf_count_t count, void *userdat
 }
 static sf_count_t memory_tell(void *userdata) { return ((MemoryAudio *)userdata)->offset; }
 
-void decoder_pcm_destroy(DecoderPcm *pcm) {
-    if (!pcm) return;
-    free(pcm->samples); memset(pcm, 0, sizeof(*pcm));
-}
-
-int decoder_decode_queue(Assembler *assembler, DecoderPcm *pcm, char *error, size_t error_size) {
+int decoder_open(Assembler *assembler, DecoderSource **src, char *error, size_t error_size) {
     AssemblerPiece piece = {0};
     unsigned char *bytes = NULL;
     size_t size = 0;
-    MemoryAudio audio;
+    DecoderSource *d;
     SF_VIRTUAL_IO io = { memory_length, memory_seek, memory_read, NULL, memory_tell };
-    SF_INFO info = {0};
-    SNDFILE *file;
-    sf_count_t frames;
-    if (!assembler || !pcm) { set_error(error, error_size, "assembler and PCM output are required"); return -1; }
-    memset(pcm, 0, sizeof(*pcm));
+    if (!assembler || !src) { set_error(error, error_size, "assembler and output are required"); return -1; }
+    *src = NULL;
     while (assembler_pop(assembler, &piece) == 1) {
         unsigned char *grown;
         if (piece.size > SIZE_MAX - size) { assembler_piece_destroy(&piece); free(bytes); set_error(error, error_size, "assembled audio is too large"); return -1; }
@@ -54,17 +55,47 @@ int decoder_decode_queue(Assembler *assembler, DecoderPcm *pcm, char *error, siz
         assembler_piece_destroy(&piece);
     }
     if (!size) { set_error(error, error_size, "assembler queue is empty"); return 0; }
-    audio.data = bytes; audio.size = (sf_count_t)size; audio.offset = 0;
-    file = sf_open_virtual(&io, SFM_READ, &info, &audio);
-    if (!file) { set_error(error, error_size, "decoder: %s", sf_strerror(NULL)); free(bytes); return -1; }
-    if (info.frames <= 0 || info.channels <= 0 || (size_t)info.frames > SIZE_MAX / ((size_t)info.channels * sizeof(short))) { sf_close(file); free(bytes); set_error(error, error_size, "unsupported or oversized audio stream"); return -1; }
-    pcm->sample_count = (size_t)info.frames * (size_t)info.channels;
-    pcm->samples = malloc(pcm->sample_count * sizeof(*pcm->samples));
-    if (!pcm->samples) { sf_close(file); free(bytes); set_error(error, error_size, "out of memory"); return -1; }
-    frames = sf_readf_short(file, pcm->samples, info.frames);
-    sf_close(file); free(bytes);
-    if (frames <= 0) { decoder_pcm_destroy(pcm); set_error(error, error_size, "decoder produced no PCM samples"); return -1; }
-    pcm->sample_count = (size_t)frames * (size_t)info.channels;
-    pcm->sample_rate = info.samplerate; pcm->channels = info.channels;
+    d = calloc(1, sizeof(*d));
+    if (!d) { free(bytes); set_error(error, error_size, "out of memory"); return -1; }
+    d->bytes = bytes;
+    d->size = (sf_count_t)size;
+    d->audio.data = bytes; d->audio.size = d->size; d->audio.offset = 0;
+    d->file = sf_open_virtual(&io, SFM_READ, &d->info, &d->audio);
+    if (!d->file) {
+        set_error(error, error_size, "decoder: %s", sf_strerror(NULL));
+        decoder_close(d);
+        return -1;
+    }
+    *src = d;
     return 1;
+}
+
+long long decoder_read_frames(DecoderSource *d, short *out, long long frame_count) {
+    if (!d || !d->file || !out || frame_count <= 0) return -1;
+    if (frame_count > d->info.frames - d->frame) frame_count = d->info.frames - d->frame;
+    if (frame_count <= 0) return 0;
+    sf_count_t read = sf_readf_short(d->file, out, frame_count);
+    if (read < 0) return -1;
+    d->frame += read;
+    return read;
+}
+
+long long decoder_seek(DecoderSource *d, long long frame) {
+    if (!d || !d->file) return -1;
+    if (frame < 0) frame = 0;
+    if (frame > d->info.frames) frame = d->info.frames;
+    if (sf_seek(d->file, frame, SEEK_SET) < 0) return -1;
+    d->frame = frame;
+    return frame;
+}
+
+long long decoder_total_frames(const DecoderSource *d) { return d ? d->info.frames : 0; }
+int decoder_channels(const DecoderSource *d) { return d ? (int)d->info.channels : 0; }
+int decoder_rate(const DecoderSource *d) { return d ? d->info.samplerate : 0; }
+
+void decoder_close(DecoderSource *d) {
+    if (!d) return;
+    if (d->file) sf_close(d->file);
+    free(d->bytes);
+    free(d);
 }
