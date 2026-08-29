@@ -458,7 +458,11 @@ BarWidget {
                     Image {
                         id: coverImg
                         anchors.fill: parent
-                        source: root.coverSource !== "" ? ("file://" + root.coverSource) : ""
+                        /* Append a cache-busting nonce so QML re-fetches the file
+                         * when a track changes (the backend also gives each cover
+                         * a fresh filename, but this makes coverVersion meaningful
+                         * even if the path were reused). */
+                        source: root.coverSource !== "" ? ("file://" + root.coverSource + "?v=" + root.coverVersion) : ""
                         fillMode: Image.PreserveAspectCrop
                         asynchronous: true
                         clip: true

@@ -104,6 +104,11 @@ static char status_file[IPC_PATH_MAX];
 static char control_file[IPC_PATH_MAX];
 static char cover_file[IPC_PATH_MAX];
 
+/* Monotonic per-process token so each committed cover file gets a unique name.
+ * A name that depends only on the (stable) track index would alias two
+ * different tracks that ever occupy the same index, showing stale art. */
+static unsigned long cover_nonce;
+
 static const char *ipc_path(char *buf, size_t size, const char *name) {
     const char *const dir = ipc_dir;
     snprintf(buf, size, "%s/%s", dir, name);
@@ -151,6 +156,25 @@ static void init_ipc_dir(void) {
     ipc_path(status_file, sizeof(status_file), "status.json");
     ipc_path(control_file, sizeof(control_file), "control");
     ipc_path(cover_file, sizeof(cover_file), "cover.jpg");
+}
+
+/* Remove every committed cover file (cover-*.jpg, not the cover.jpg scratch)
+ * from the IPC directory.  Called before writing a new one so the directory
+ * holds at most a single cover file and never leaks stale art across sessions
+ * or library edits. */
+static void remove_cover_files(void) {
+    DIR *dir = opendir(ipc_dir);
+    struct dirent *entry;
+    if (!dir) return;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "cover-", 6) == 0 &&
+            strstr(entry->d_name, ".jpg") != NULL) {
+            char path[IPC_PATH_MAX + 256];
+            snprintf(path, sizeof(path), "%s/%s", ipc_dir, entry->d_name);
+            unlink(path);
+        }
+    }
+    closedir(dir);
 }
 
 static volatile sig_atomic_t stop_requested;
@@ -1133,7 +1157,12 @@ static void *fetch_worker(void *arg) {
         if (save_cover[0]) {
             char unique[420];
             const char *const dir = ipc_dir;
-            snprintf(unique, sizeof(unique), "%s/cover-%zu.jpg", dir, job->index);
+            /* Drop prior covers: the directory stays at one committed cover,
+             * and the file name gains a fresh nonce so a later track that
+             * shares this index cannot alias (and show stale art for) it. */
+            remove_cover_files();
+            unsigned long nonce = ++cover_nonce;
+            snprintf(unique, sizeof(unique), "%s/cover-%zu-%lu.jpg", dir, job->index, nonce);
             rename(save_cover, unique);
             snprintf(save_cover, sizeof(save_cover), "%s", unique);
         }
@@ -2051,6 +2080,7 @@ int main(int argc, char **argv) {
     cancel_fetch(&state);
     if (state.audio_device) SDL_CloseAudioDevice(state.audio_device);
     if (state.decoder) { decoder_close(state.decoder); state.decoder = NULL; }
+    remove_cover_files(); /* GC committed covers on shutdown */
     pthread_mutex_destroy(&state.fetch_mutex);
     stop_ssh_agent(&state);
     if (!headless) { nk_sdl_shutdown(); SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); }
