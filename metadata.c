@@ -72,6 +72,23 @@ static char *shell_quote(const char *value) {
     return remote_command_with_path("", value);
 }
 
+/* Build a local shell command: `prefix`, a properly single-quoted `path`, then
+ * `suffix`. Embedded single quotes in `path` are escaped ('\''), so a filename
+ * can never terminate the quoted argument early and inject into the shell.
+ * Returns a malloc'd string the caller must free, or NULL on allocation
+ * failure. */
+static char *local_command_with_path(const char *prefix, const char *path, const char *suffix) {
+    char *command = remote_command_with_path(prefix, path);
+    char *grown;
+    size_t total;
+    if (!command) return NULL;
+    total = strlen(command) + strlen(suffix) + 1;
+    grown = realloc(command, total);
+    if (!grown) { free(command); return NULL; }
+    strcat(grown, suffix);
+    return grown;
+}
+
 /* Parse key=value format output from mediainfo */
 static void parse_mediainfo_line(const char *line, AudioMetadata *metadata) {
     char key[256], value[256];
@@ -110,15 +127,21 @@ static void parse_ffprobe_line(const char *line, AudioMetadata *metadata) {
 /* Extract metadata using mediainfo command */
 static int extract_with_mediainfo(const char *filepath, AudioMetadata *metadata, char *error, size_t error_size) {
     FILE *pipe;
-    char command[1024];
+    char *command;
     char line[512];
 
-    if (snprintf(command, sizeof(command), "mediainfo --Output='General;Title=%%Title%% \\nPerformer=%%Performer%% \\nAlbum=%%Album%%' -- '%s' 2>/dev/null", filepath) >= (int)sizeof(command)) {
+    /* --Output uses %Title% etc. inside single quotes; the path is escaped so
+     * an embedded single quote cannot break out of the argument. */
+    command = local_command_with_path(
+        "mediainfo --Output='General;Title=%Title% \\nPerformer=%Performer% \\nAlbum=%Album%' -- ",
+        filepath, " 2>/dev/null");
+    if (!command) {
         set_error(error, error_size, "Command path too long");
         return -1;
     }
 
     pipe = popen(command, "r");
+    free(command);
     if (!pipe) {
         set_error(error, error_size, "Could not execute mediainfo");
         return -1;
@@ -135,15 +158,19 @@ static int extract_with_mediainfo(const char *filepath, AudioMetadata *metadata,
 /* Extract metadata using ffprobe command */
 static int extract_with_ffprobe(const char *filepath, AudioMetadata *metadata, char *error, size_t error_size) {
     FILE *pipe;
-    char command[1024];
+    char *command;
     char line[512];
 
-    if (snprintf(command, sizeof(command), "ffprobe -v error -show_entries format_tags -of default=noprint_wrappers=1 '%s' 2>/dev/null", filepath) >= (int)sizeof(command)) {
+    command = local_command_with_path(
+        "ffprobe -v error -show_entries format_tags -of default=noprint_wrappers=1 ",
+        filepath, " 2>/dev/null");
+    if (!command) {
         set_error(error, error_size, "Command path too long");
         return -1;
     }
 
     pipe = popen(command, "r");
+    free(command);
     if (!pipe) {
         set_error(error, error_size, "Could not execute ffprobe");
         return -1;
