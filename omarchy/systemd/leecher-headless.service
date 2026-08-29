@@ -1,7 +1,11 @@
 [Unit]
 Description=Leecher Music Player headless backend
-After=graphical-session-pre.target pipewire.service wireplumber.service
-Wants=pipewire.service wireplumber.service
+# SDL audio uses the PipeWire PulseAudio-compatible endpoint, so we must start
+# after the audio graph is up. graphical-session-pre.target is too early: the
+# app would open its SDL device before audio is available and silently play
+# into nothing (position frozen at 0, no output stream) until restarted.
+After=graphical-session.target pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire.service pipewire-pulse.service wireplumber.service
 
 [Service]
 Type=simple

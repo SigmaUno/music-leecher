@@ -19,10 +19,14 @@ BarWidget {
     property int durationMs: 0
     property bool hasTrack: false
     property bool autoplay: true
+    property string coverSource: ""
+    property int coverVersion: 0
 
     property int basePosition: 0
     property real baseTime: 0
     property bool playing: false
+    property int lastSrvPos: 0
+    property bool serverAdvancing: true
 
     property real positionMs: 0
     property bool popupOpen: false
@@ -46,7 +50,7 @@ BarWidget {
     readonly property bool effectiveHidden: root.hidden && !root.hoverPeek
 
     visible: !root.closed
-    implicitWidth: root.effectiveHidden ? root.barSize : root.barSize * 6
+    implicitWidth: root.effectiveHidden ? root.barSize : Style.space(24) + root.barSize + Style.space(6) + Style.space(150) + Style.space(18)
     implicitHeight: root.barSize
 
     function now() {
@@ -54,6 +58,11 @@ BarWidget {
     }
     function currentPosition() {
         if (!root.playing)
+            return root.basePosition;
+        /* Only extrapolate while the backend is actually confirming progress.
+         * If it has stalled (position not advancing) we race ahead and then snap
+         * back every poll, which showed up as a 0:00/0:01 flicker. */
+        if (!root.serverAdvancing)
             return root.basePosition;
         var pos = root.basePosition + (root.now() - root.baseTime);
         return Math.min(pos, root.durationMs || pos);
@@ -162,14 +171,29 @@ BarWidget {
         var trackChanged = newTitle !== root.title || newDur !== root.durationMs;
         var playingChanged = isPlayingNow !== root.playing;
         var srvPos = Number(data.position_ms || 0);
+
+        /* Track whether the backend is confirming playback progress. If it stops
+         * advancing, stop extrapolating so the clock doesn't flicker back and
+         * forth between 0:00 and 0:01. */
+        if (!isPlayingNow) {
+            root.serverAdvancing = true;
+        } else if (srvPos - root.lastSrvPos >= 200) {
+            root.serverAdvancing = true;
+        } else {
+            root.serverAdvancing = false;
+        }
+
         var estimate = root.currentPosition();
 
         if (trackChanged) {
             root.basePosition = srvPos;
             root.baseTime = root.now();
+            root.serverAdvancing = true;
+            root.coverVersion++;
         } else if (playingChanged) {
             root.basePosition = root.currentPosition();
             root.baseTime = root.now();
+            root.serverAdvancing = true;
         } else if (Math.abs(srvPos - estimate) > 1200) {
             root.basePosition = srvPos;
             root.baseTime = root.now();
@@ -184,12 +208,14 @@ BarWidget {
         root.playing = isPlayingNow;
         root.autoplay = data.autoplay !== false;
         root.hasTrack = root.title !== "";
+        root.coverSource = data.cover ? String(data.cover) : "";
         root.selectedTrackIndex = idx;
         if (isPlayingNow && root.pendingPlayIndex >= 0 && idx === root.pendingPlayIndex) {
             root.pendingPlayIndex = -1;
         }
         if (data.library)
             root.libraryPath = String(data.library);
+        root.lastSrvPos = srvPos;
         root.clampPosition();
     }
     function loadLibrary() {
@@ -248,7 +274,7 @@ BarWidget {
         id: row
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.leftMargin: root.effectiveHidden ? 0 : Style.space(18)
+        anchors.leftMargin: root.effectiveHidden ? Style.space(12) : Style.space(24)
         anchors.rightMargin: root.effectiveHidden ? 0 : Style.space(18)
         anchors.verticalCenter: parent.verticalCenter
         spacing: root.effectiveHidden ? 0 : Style.space(6)
@@ -262,6 +288,17 @@ BarWidget {
             font.pixelSize: Style.font.body
         }
 
+        MouseArea {
+            anchors.fill: glyph
+            z: 10
+            cursorShape: Qt.PointingHandCursor
+            hoverEnabled: true
+            onClicked: {
+                if (root.hasTrack)
+                    root.playPause();
+            }
+        }
+
         Text {
             id: label
             anchors.verticalCenter: parent.verticalCenter
@@ -272,7 +309,7 @@ BarWidget {
             font.pixelSize: Style.font.body
             font.italic: !root.hasTrack
             elide: Text.ElideRight
-            width: Math.min(150, implicitWidth)
+            width: Math.max(0, Math.min(Style.space(150), row.width - Style.space(24) - glyph.width - row.spacing - Style.space(18)))
         }
     }
 
@@ -322,36 +359,68 @@ BarWidget {
             anchors.fill: parent
             spacing: Style.space(10)
 
-            Column {
+            Row {
                 width: parent.width
-                spacing: Style.space(2)
+                spacing: Style.space(12)
 
-                Text {
-                    text: root.title || "No song loaded"
-                    color: root.bar.foreground
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.subtitle
-                    font.bold: true
-                    elide: Text.ElideRight
-                    width: parent.width
+                Column {
+                    width: parent.width - Style.space(96) - Style.space(12)
+                    spacing: Style.space(2)
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Text {
+                        text: root.title || "No song loaded"
+                        color: root.bar.foreground
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.subtitle
+                        font.bold: true
+                        elide: Text.ElideRight
+                        width: parent.width
+                    }
+                    Text {
+                        text: root.artist
+                        color: Qt.darker(root.bar.foreground, 1.3)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        elide: Text.ElideRight
+                        width: parent.width
+                        visible: text !== ""
+                    }
+                    Text {
+                        text: root.album
+                        color: Qt.darker(root.bar.foreground, 1.6)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                        width: parent.width
+                        visible: text !== ""
+                    }
                 }
-                Text {
-                    text: root.artist
-                    color: Qt.darker(root.bar.foreground, 1.3)
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    elide: Text.ElideRight
-                    width: parent.width
-                    visible: text !== ""
-                }
-                Text {
-                    text: root.album
-                    color: Qt.darker(root.bar.foreground, 1.6)
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
-                    width: parent.width
-                    visible: text !== ""
+
+                Item {
+                    id: coverItem
+                    width: Style.space(96)
+                    height: Style.space(96)
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Rectangle {
+                        id: coverBox
+                        anchors.fill: parent
+                        radius: Style.cornerRadius
+                        color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
+                        border.width: 1
+                        border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.18)
+                    }
+
+                    Image {
+                        id: coverImg
+                        anchors.fill: parent
+                        source: root.coverSource !== "" ? ("file://" + root.coverSource) : ""
+                        fillMode: Image.PreserveAspectCrop
+                        asynchronous: true
+                        clip: true
+                        visible: root.coverSource !== ""
+                    }
                 }
             }
 
@@ -446,6 +515,7 @@ BarWidget {
                 Button {
                     iconText: root.autoplay ? "\uf01e" : "\uf00d"
                     foreground: root.autoplay ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
+                    width: Style.space(36)
                     height: Style.space(36)
                     iconSize: Style.font.icon
                     horizontalPadding: Style.spacing.controlPaddingX

@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <strings.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -52,6 +54,9 @@ typedef struct {
     char ssh_agent_socket[96];
     int is_playing;
     Uint32 position_ms;
+    Uint32 last_position_ms;
+    int position_stalls;
+    Uint32 last_audio_retry_ms;
     Uint32 duration_ms;
     short *audio_samples;
     size_t audio_total_frames;
@@ -61,6 +66,7 @@ typedef struct {
     Uint32 audio_tail_bytes;
     int track_ended;
     char library_path[512];
+    char cover_file[512];
     int autoplay;
     MusicRipperTransports transports;
     pthread_mutex_t fetch_mutex;
@@ -78,14 +84,17 @@ typedef struct {
     char fetch_title[128];
     char fetch_artist[128];
     char fetch_album[128];
+    char fetch_cover[512];
     int immediate_pending;
     size_t immediate_index;
     int pending_valid;
     size_t pending_index;
+    int autoplay_advancing;
 } AppState;
 
 #define STATUS_FILE "/tmp/leecher-status.json"
 #define CONTROL_FILE "/tmp/leecher-control"
+#define COVER_FILE  "/tmp/leecher-cover.jpg"
 
 static volatile sig_atomic_t stop_requested;
 
@@ -124,17 +133,19 @@ static char *json_escape(const char *value) {
 
 static void write_status(const AppState *state) {
     char *title = json_escape(state->title), *artist = json_escape(state->artist),
-         *album = json_escape(state->album), *library = json_escape(state->library_path);
+         *album = json_escape(state->album), *library = json_escape(state->library_path),
+         *cover = json_escape(state->cover_file[0] ? state->cover_file : NULL);
     FILE *file = fopen(STATUS_FILE, "w");
-    if (!file) { free(title); free(artist); free(album); free(library); return; }
+    if (!file) { free(title); free(artist); free(album); free(library); free(cover); return; }
     fprintf(file, "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
-                  "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s}\n",
+                  "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,\"cover\":\"%s\"}\n",
             title ? title : "", artist ? artist : "", album ? album : "",
             state->position_ms, state->duration_ms,
             state->is_playing ? "true" : "false", state->selected_track,
-            library ? library : "", state->autoplay ? "true" : "false");
+            library ? library : "", state->autoplay ? "true" : "false",
+            cover ? cover : "");
     fclose(file);
-    free(title); free(artist); free(album); free(library);
+    free(title); free(artist); free(album); free(library); free(cover);
 }
 
 /* Zenity is a separate GTK process.  Do not let it inherit SDL, SSH-agent, or
@@ -280,7 +291,8 @@ static int stream_ssh(const LibrarySource *source, MusicRipperWriteFn write,
     pid = fork();
     if (pid == 0) {
         char *const arguments[] = { "ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "RequestTTY=no",
-            "-o", "ClearAllForwardings=yes", "-o", "LogLevel=ERROR", "--", target, command, NULL };
+            "-o", "ClearAllForwardings=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=8",
+            "--", target, command, NULL };
         close(pipe_fds[0]);
         if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) _exit(127);
         close(pipe_fds[1]);
@@ -592,8 +604,168 @@ static void choose_ssh_file(AppState *state) {
     unlink(temp_file);
 }
 
+/* Returns the file name of `path` without its directory and extension into
+ * `out`; used as a fallback title when an audio file has no tags. */
+static char *basename_no_ext(const char *path, char *out, size_t out_size) {
+    const char *base = strrchr(path, '/');
+    const char *name = base ? base + 1 : path;
+    snprintf(out, out_size, "%s", name);
+    char *dot = strrchr(out, '.');
+    if (dot) *dot = '\0';
+    return out;
+}
 
+/* True when `s` is present and contains a non-whitespace character. */
+static int has_real_text(const char *s) {
+    if (!s) return 0;
+    while (*s) { if (!isspace((unsigned char)*s)) return 1; s++; }
+    return 0;
+}
 
+/* Builds a LibrarySongQuery for `file_path`, extracting metadata from the file
+ * (or remotely over SSH when `remote` is set) and filling any missing field
+ * with a fallback so that library_handler_add_source (which requires a non-empty
+ * title, artist, and album) can accept the entry. All string buffers must be
+ * caller-owned. Returns a query pointing at those buffers. */
+static LibrarySongQuery build_song_query(AppState *state, const char *file_path,
+                                         int remote, char *title, size_t title_size,
+                                         char *artist, size_t artist_size,
+                                         char *album, size_t album_size) {
+    AudioMetadata metadata = {0};
+    char error[256] = {0};
+    char file_title[256];
+    int got = remote
+        ? metadata_extract_from_ssh(state->username, state->ip, file_path, &metadata, error, sizeof(error))
+        : metadata_extract_from_file(file_path, &metadata, error, sizeof(error));
+    basename_no_ext(file_path, file_title, sizeof(file_title));
+    snprintf(title, title_size, "%s", has_real_text(metadata.title) ? metadata.title : file_title);
+    snprintf(artist, artist_size, "%s", has_real_text(metadata.artist) ? metadata.artist : "Unknown artist");
+    snprintf(album, album_size, "%s", has_real_text(metadata.album) ? metadata.album : "Unknown album");
+    if (got != 1) snprintf(state->status, sizeof(state->status), "No tags for %.160s, imported by file name.", file_path);
+    metadata_destroy(&metadata);
+    return (LibrarySongQuery){ .title = title, .artist = artist, .album = album };
+}
+
+/* Adds a source for a single audio file to the library and reloads the in-memory
+ * handler so the new entry is visible immediately. Returns 1 when a source was
+ * saved (the track may be new or a merge into an existing one). */
+static int import_single_source(const char *library_path, AppState *state,
+                                const LibrarySongQuery *song, const LibrarySource *source,
+                                LibraryHandler **library, MusicRipper *ripper) {
+    char error[256] = {0};
+    if (library_handler_add_source(library_path, song, source, error, sizeof(error)) != 1) {
+        snprintf(state->status, sizeof(state->status), "Import failed for %.160s: %s", song->title, error);
+        return 0;
+    }
+    LibraryHandler *reloaded = library_handler_open(library_path, error, sizeof(error));
+    if (reloaded) {
+        library_handler_close(*library);
+        *library = reloaded;
+        if (ripper) ripper->library = reloaded;
+    }
+    return 1;
+}
+
+/* True when `name` ends in a recognised audio extension. */
+static int is_audio_name(const char *name) {
+    static const char *exts[] = { ".mp3", ".flac", ".ogg", ".wav", ".m4a", ".aac", ".opus", ".wma" };
+    size_t i;
+    const char *dot;
+    if (!name || !*name) return 0;
+    dot = strrchr(name, '.');
+    if (!dot) return 0;
+    for (i = 0; i < sizeof(exts) / sizeof(exts[0]); i++)
+        if (strcasecmp(dot, exts[i]) == 0) return 1;
+    return 0;
+}
+
+/* Pull every playable song out of the directory in `dir` and import it as a
+ * LOCAL source, de-duplicating by exact title/artist/album. */
+static void pull_local_songs(const char *library_path, AppState *state,
+                             const char *dir, LibraryHandler **library, MusicRipper *ripper) {
+    DIR *d;
+    struct dirent *ent;
+    int total = 0, added = 0;
+
+    if (!dir || !dir[0]) { snprintf(state->status, sizeof(state->status), "Enter a PATH directory to pull songs from."); return; }
+    d = opendir(dir);
+    if (!d) { snprintf(state->status, sizeof(state->status), "Cannot open directory: %.180s", dir); return; }
+    while ((ent = readdir(d)) != NULL) {
+        char full[1024];
+        struct stat st;
+        LibrarySongQuery song;
+        LibrarySource source;
+        char title[256], artist[256], album[256];
+        if (ent->d_name[0] == '.' || !is_audio_name(ent->d_name)) continue;
+        if (snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name) >= (int)sizeof(full)) continue;
+        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        total++;
+        song = build_song_query(state, full, 0, title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
+        source = (LibrarySource){ .kind = LIBRARY_SOURCE_LOCAL, .path = full };
+        if (import_single_source(library_path, state, &song, &source, library, ripper)) added++;
+    }
+    closedir(d);
+    snprintf(state->status, sizeof(state->status), "Local pull: %d of %d songs imported from %.160s.", added, total, dir);
+}
+
+/* Pull every playable song under the remote `path` (via find over SSH) and import
+ * each as an SSH source, de-duplicating by exact title/artist/album. */
+static void pull_ssh_songs(const char *library_path, AppState *state,
+                           LibraryHandler **library, MusicRipper *ripper) {
+    char command[2048];
+    char temp_file[256];
+    char line[1024];
+    FILE *list;
+    int total = 0, added = 0;
+
+    if (!state->username[0] || !state->ip[0]) { snprintf(state->status, sizeof(state->status), "Enter USERNAME and IP first."); return; }
+    if (!state->path[0]) { snprintf(state->status, sizeof(state->status), "Enter a PATH directory to pull songs from."); return; }
+    snprintf(temp_file, sizeof(temp_file), "/tmp/leecher_pull_%ld.txt", (long)time(NULL));
+    if (snprintf(command, sizeof(command),
+        "ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -- %s@%s "
+        "'find \"%s\" -maxdepth 1 -type f \\( -iname \"*.mp3\" -o -iname \"*.flac\" -o -iname \"*.ogg\" -o -iname \"*.wav\" -o -iname \"*.m4a\" \\) 2>/dev/null | sort' > %s 2>&1",
+        state->username, state->ip, state->path, temp_file) >= (int)sizeof(command)) {
+        snprintf(state->status, sizeof(state->status), "SSH command too long.");
+        return;
+    }
+    system(command);
+    list = fopen(temp_file, "r");
+    if (!list) { snprintf(state->status, sizeof(state->status), "Could not run SSH find."); return; }
+    while (fgets(line, sizeof(line), list)) {
+        char *path;
+        LibrarySongQuery song;
+        LibrarySource source;
+        char title[256], artist[256], album[256];
+        line[strcspn(line, "\r\n")] = '\0';
+        path = line;
+        while (*path == ' ' || *path == '\t') path++;
+        if (!*path) continue;
+        total++;
+        song = build_song_query(state, path, 1, title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
+        source = (LibrarySource){ .kind = LIBRARY_SOURCE_SSH, .path = path, .username = state->username, .ip = state->ip };
+        if (import_single_source(library_path, state, &song, &source, library, ripper)) added++;
+    }
+    fclose(list);
+    unlink(temp_file);
+    snprintf(state->status, sizeof(state->status), "SSH pull: %d of %d songs imported from %.160s.", added, total, state->path);
+}
+
+/* Imports a single file dropped onto the window into the library as a LOCAL
+ * source. */
+static void handle_dropped_file(const char *library_path, AppState *state, const char *file,
+                                LibraryHandler **library, MusicRipper *ripper) {
+    struct stat st;
+    LibrarySource source;
+    LibrarySongQuery song;
+    char title[256], artist[256], album[256];
+    if (!file || !file[0]) return;
+    if (stat(file, &st) != 0 || !S_ISREG(st.st_mode)) { snprintf(state->status, sizeof(state->status), "Dropped item is not a regular file: %.160s", file); return; }
+    if (!is_audio_name(file)) { snprintf(state->status, sizeof(state->status), "Dropped item is not an audio file: %.160s", file); return; }
+    song = build_song_query(state, file, 0, title, sizeof(title), artist, sizeof(artist), album, sizeof(album));
+    source = (LibrarySource){ .kind = LIBRARY_SOURCE_LOCAL, .path = (char *)file };
+    if (import_single_source(library_path, state, &song, &source, library, ripper))
+        snprintf(state->status, sizeof(state->status), "Imported dropped file: %.160s", file);
+}
 
 static void write_status(const AppState *state);
 
@@ -617,7 +789,135 @@ static void free_fetch_cache(AppState *s) {
     s->fetch_title[0] = '\0';
     s->fetch_artist[0] = '\0';
     s->fetch_album[0] = '\0';
+    s->fetch_cover[0] = '\0';
     s->fetch_ready = 0;
+}
+
+/* Single-quote a value for the local shell (for the ffmpeg path argument). */
+static char *shell_quote_words(const char *value) {
+    size_t len = 3, i;
+    char *out;
+    for (i = 0; value[i]; i++) len += value[i] == '\'' ? 4 : 1;
+    out = malloc(len);
+    if (!out) return NULL;
+    {   char *p = out; *p++ = '\'';
+        for (i = 0; value[i]; i++) {
+            if (value[i] == '\'') { memcpy(p, "'\\''", 4); p += 4; }
+            else *p++ = value[i];
+        }
+        *p++ = '\''; *p = '\0';
+    }
+    return out;
+}
+
+/* Accepts only safe SSH username/IP characters (prevents shell injection). */
+static int ssh_name_valid(const char *value, int allow_colon) {
+    const unsigned char *p = (const unsigned char *)value;
+    if (!p || !*p) return 0;
+    for (; *p; p++) {
+        if (!isalnum(*p) && *p != '.' && *p != '-' && *p != '_' &&
+            !(allow_colon && *p == ':')) return 0;
+    }
+    return 1;
+}
+
+/* Runs `cmd` via /bin/sh -c in its own process group, bounded by timeout_ms.
+ * Returns the child's exit status (or -1 on setup failure / timeout). The
+ * process group kill on timeout ensures any grandchildren (ssh, ffmpeg, curl)
+ * are also terminated, so a stuck network source can never hang the player. */
+static int run_command_timeout(const char *cmd, int timeout_ms) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        signal(SIGINT, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+        setpgid(0, 0);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    signal(SIGPIPE, SIG_IGN);
+    int status;
+    int waited = 0;
+    while (waited < timeout_ms) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        usleep(50000);
+        waited += 50;
+    }
+    kill(-pid, SIGKILL);
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    return -1;
+}
+
+/* Runs ffmpeg to pull the first attached-picture (cover) from `input` (an
+ * already shell-quoted ffmpeg input argument) into COVER_FILE, writing the
+ * resulting path into `out` (cleared when no attached picture is found). */
+static void run_ffmpeg_cover(const char *input, char *out, size_t out_size, int timeout_ms) {
+    char command[3600];
+    struct stat st;
+    out[0] = '\0';
+    if (snprintf(command, sizeof(command),
+                 "ffmpeg -v error -y -i %s -an -map 0:v:0 -c:v copy -frames:v 1 '" COVER_FILE "' 2>/dev/null",
+                 input) >= (int)sizeof(command))
+        return;
+    if (run_command_timeout(command, timeout_ms) == 0 && stat(COVER_FILE, &st) == 0 && st.st_size > 0)
+        snprintf(out, out_size, "%s", COVER_FILE);
+}
+
+/* Extracts embedded album art from any supported source kind into COVER_FILE
+ * using ffmpeg, and writes its path into `out` (cleared when there is no
+ * embedded art). Local files and HTTPS URLs are passed straight to ffmpeg;
+ * SSH/network files are streamed over ssh to ffmpeg's stdin so only the tiny
+ * cover frame is transferred, not the whole track. */
+static void extract_source_cover(const LibrarySource *source, char *out, size_t out_size) {
+    out[0] = '\0';
+    if (!source) return;
+    switch (source->kind) {
+    case LIBRARY_SOURCE_LOCAL: {
+        if (!source->path || !source->path[0]) return;
+        char *q = shell_quote_words(source->path);
+        if (q) { run_ffmpeg_cover(q, out, out_size, 10000); free(q); }
+        break;
+    }
+    case LIBRARY_SOURCE_HTTPS: {
+        if (!source->url || !source->url[0]) return;
+        char *q = shell_quote_words(source->url);
+        if (q) { run_ffmpeg_cover(q, out, out_size, 15000); free(q); }
+        break;
+    }
+    case LIBRARY_SOURCE_SSH:
+    case LIBRARY_SOURCE_NETWORK: {
+        if (!source->path || !source->path[0]) return;
+        if (!source->username || !source->username[0]) return;
+        if (!source->ip || !source->ip[0]) return;
+        if (!ssh_name_valid(source->username, 0) || !ssh_name_valid(source->ip, 1)) return;
+        char *qpath = shell_quote_words(source->path);
+        if (!qpath) return;
+        char *remote_cmd = malloc(strlen("cat ") + strlen(qpath) + 1);
+        if (!remote_cmd) { free(qpath); return; }
+        sprintf(remote_cmd, "cat %s", qpath);
+        free(qpath);
+        char *qcmd = shell_quote_words(remote_cmd);
+        free(remote_cmd);
+        if (!qcmd) return;
+        char command[3600];
+        if (snprintf(command, sizeof(command),
+                     "ssh -F /dev/null -o BatchMode=yes -o RequestTTY=no -o ClearAllForwardings=yes -o LogLevel=ERROR -- %s@%s %s 2>/dev/null | ffmpeg -v error -y -i - -an -map 0:v:0 -c:v copy -frames:v 1 '" COVER_FILE "' 2>/dev/null",
+                     source->username, source->ip, qcmd) >= (int)sizeof(command)) {
+            free(qcmd);
+            return;
+        }
+        free(qcmd);
+        struct stat st;
+        if (run_command_timeout(command, 8000) == 0 && stat(COVER_FILE, &st) == 0 && st.st_size > 0)
+            snprintf(out, out_size, "%s", COVER_FILE);
+        break;
+    }
+    default:
+        break;
+    }
 }
 
 static void *fetch_worker(void *arg) {
@@ -628,12 +928,22 @@ static void *fetch_worker(void *arg) {
     DecoderPcm pcm = {0};
     char error[256] = {0};
     char save_title[128] = {0}, save_artist[128] = {0}, save_album[128] = {0};
+    char save_cover[512] = {0};
     int ready = 0;
     if (library_handler_track_at(job->library, job->index, &track, error, sizeof(error)) == 1) {
         song = (LibrarySongQuery){ .id = track.id, .title = track.title, .artist = track.artist, .album = track.album };
         if (track.title) snprintf(save_title, sizeof(save_title), "%s", track.title);
         if (track.artist) snprintf(save_artist, sizeof(save_artist), "%s", track.artist);
         if (track.album) snprintf(save_album, sizeof(save_album), "%s", track.album);
+        for (size_t ci = 0; ci < track.source_count && save_cover[0] == '\0'; ci++) {
+            extract_source_cover(&track.sources[ci], save_cover, sizeof(save_cover));
+        }
+        if (save_cover[0]) {
+            char unique[512];
+            snprintf(unique, sizeof(unique), "/tmp/leecher-cover-%zu.jpg", job->index);
+            rename(save_cover, unique);
+            snprintf(save_cover, sizeof(save_cover), "%s", unique);
+        }
         if (!s->fetch_cancel &&
             music_ripper_play_next(&job->ripper, &song, NULL, assemble_audio, job->assembler, error, sizeof(error)) == 1 &&
             !s->fetch_cancel &&
@@ -655,6 +965,7 @@ static void *fetch_worker(void *arg) {
         snprintf(s->fetch_title, sizeof(s->fetch_title), "%s", save_title);
         snprintf(s->fetch_artist, sizeof(s->fetch_artist), "%s", save_artist);
         snprintf(s->fetch_album, sizeof(s->fetch_album), "%s", save_album);
+        snprintf(s->fetch_cover, sizeof(s->fetch_cover), "%s", save_cover);
         s->fetch_ready = 1;
         fetch_unlock(s);
     }
@@ -742,6 +1053,7 @@ static void commit_fetch(AppState *s, size_t idx) {
     snprintf(s->title, sizeof(s->title), "%s", s->fetch_title);
     snprintf(s->artist, sizeof(s->artist), "%s", s->fetch_artist);
     snprintf(s->album, sizeof(s->album), "%s", s->fetch_album);
+    snprintf(s->cover_file, sizeof(s->cover_file), "%s", s->fetch_cover);
     bytes = total_frames * (size_t)channels * sizeof(short);
     s->fetch_samples = NULL;
     free_fetch_cache(s);
@@ -795,6 +1107,7 @@ static void request_play(const LibraryHandler *library, AppState *s, size_t inde
 }
 
 static void play_library_index(const LibraryHandler *library, AppState *state, size_t index) {
+    state->autoplay_advancing = 0;
     request_play(library, state, index);
 }
 
@@ -804,6 +1117,7 @@ static void play_library_relative(const LibraryHandler *library, AppState *state
     long cur = (long)state->selected_track;
     long nxt = (cur + delta) % (long)count;
     if (nxt < 0) nxt += (long)count;
+    state->autoplay_advancing = 0;
     request_play(library, state, (size_t)nxt);
 }
 
@@ -841,6 +1155,36 @@ static void seek_ms(AppState *s, Uint32 ms) {
     s->track_ended = 0;
     SDL_PauseAudioDevice(s->audio_device, s->is_playing ? 0 : 1);
     snprintf(s->status, sizeof(s->status), "Seeked to %u:%02u.", s->position_ms / 60000, (s->position_ms / 1000) % 60);
+    write_status(s);
+}
+
+/* Called when `is_playing` but the SDL device is not actually draining (no
+ * position advance). This happens when the backend starts before the
+ * PulseAudio/PipeWire graph is ready: SDL_OpenAudioDevice may report success
+ * but never create a working output stream, so the queued PCM is never
+ * consumed and the player silently "plays" into nothing. Reopen the device
+ * from the buffered samples so playback self-heals instead of running dead
+ * until a manual restart. */
+static void retry_audio_device(AppState *s) {
+    if (s->audio_device) SDL_CloseAudioDevice(s->audio_device);
+    s->audio_device = 0;
+    if (!s->audio_samples || s->audio_channels <= 0 || s->audio_rate <= 0) {
+        s->is_playing = 0;
+        write_status(s);
+        return;
+    }
+    SDL_AudioSpec desired = {0}, obtained = {0};
+    desired.freq = s->audio_rate; desired.format = AUDIO_S16SYS;
+    desired.channels = (Uint8)s->audio_channels; desired.samples = 4096;
+    s->audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
+    if (!s->audio_device) { snprintf(s->status, sizeof(s->status), "SDL audio: %s", SDL_GetError()); s->is_playing = 0; write_status(s); return; }
+    size_t offset = (size_t)s->audio_tail_frame * (size_t)s->audio_channels;
+    size_t remain_frames = s->audio_total_frames - s->audio_tail_frame;
+    if (remain_frames > 0)
+        SDL_QueueAudio(s->audio_device, s->audio_samples + offset, (Uint32)(remain_frames * (size_t)s->audio_channels * sizeof(short)));
+    s->audio_tail_bytes = (Uint32)(remain_frames * (size_t)s->audio_channels * sizeof(short));
+    SDL_PauseAudioDevice(s->audio_device, s->is_playing ? 0 : 1);
+    snprintf(s->status, sizeof(s->status), "Restarted audio output.");
     write_status(s);
 }
 
@@ -976,7 +1320,14 @@ static void draw_scraper(struct nk_context *ctx, AppState *state, LibraryHandler
     nk_label(ctx, "Album", NK_TEXT_LEFT); nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, state->album, sizeof(state->album), nk_filter_default);
     if (state->method == SOURCE_LOCAL || state->method == SOURCE_SSH || state->method == SOURCE_NETWORK) {
         nk_label(ctx, "PATH", NK_TEXT_LEFT); nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, state->path, sizeof(state->path), nk_filter_default);
-        if (state->method == SOURCE_LOCAL) { nk_layout_row_dynamic(ctx, 28, 1); if (nk_button_label(ctx, "Choose local music file")) choose_local_file(state); nk_layout_row_dynamic(ctx, 24, 1); }
+        if (state->method == SOURCE_LOCAL) {
+            nk_layout_row_dynamic(ctx, 28, 1);
+            if (nk_button_label(ctx, "Choose local music file")) choose_local_file(state);
+            if (nk_button_label(ctx, "Pull all unique songs from path")) pull_local_songs(library_path, state, state->path, library, ripper);
+            nk_layout_row_dynamic(ctx, 22, 1);
+            nk_label(ctx, "Drag audio files from your file manager into this window to import them.", NK_TEXT_LEFT);
+            nk_layout_row_dynamic(ctx, 24, 1);
+        }
     }
     if (state->method == SOURCE_SSH || state->method == SOURCE_NETWORK) {
         nk_label(ctx, "USERNAME", NK_TEXT_LEFT); nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, state->username, sizeof(state->username), nk_filter_default);
@@ -985,6 +1336,7 @@ static void draw_scraper(struct nk_context *ctx, AppState *state, LibraryHandler
             nk_layout_row_dynamic(ctx, 28, 1); 
             if (nk_button_label(ctx, "Choose remote music file")) choose_ssh_file(state); 
             if (nk_button_label(ctx, "Extract SSH metadata")) extract_ssh_metadata(state); 
+            if (nk_button_label(ctx, "Pull all unique songs from path")) pull_ssh_songs(library_path, state, library, ripper); 
             nk_layout_row_dynamic(ctx, 24, 1); 
         }
     }
@@ -1236,6 +1588,7 @@ int main(int argc, char **argv) {
         if (!window || !renderer) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); if (renderer) SDL_DestroyRenderer(renderer); if (window) SDL_DestroyWindow(window); SDL_Quit(); assembler_destroy(assembler); library_handler_close(library); return 1; }
         ctx = nk_sdl_init(window, renderer);
         nk_sdl_font_stash_begin(&font_atlas);
+        SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
     }
     struct nk_font *ui_font = NULL;
     if (!headless) {
@@ -1258,6 +1611,16 @@ int main(int argc, char **argv) {
         apply_theme(ctx, &palette, ui_font);
     }
     write_status(&state);
+    /* With autoplay on, start the first track so the widget has something to
+     * play immediately rather than showing an empty, idle player. The fetch
+     * runs in the background and is committed by the loop once it is ready. */
+    if (state.autoplay && !state.immediate_pending && !state.pending_valid && !state.audio_device && !state.autoplay_advancing) {
+        size_t count = library_handler_track_count(library);
+        if (count > 0) {
+            state.autoplay_advancing = 1;
+            request_play(library, &state, 0);
+        }
+    }
     while (running && !stop_requested) {
         poll_control(&library, &ripper, assembler, &state, library_path);
 
@@ -1265,8 +1628,17 @@ int main(int argc, char **argv) {
         if (state.immediate_pending) {
             fetch_lock(&state);
             int ready = state.fetch_ready && state.fetch_index == state.immediate_index;
+            int failed = !state.fetch_active && !state.fetch_ready;
             fetch_unlock(&state);
-            if (ready) commit_fetch(&state, state.immediate_index);
+            if (ready) {
+                commit_fetch(&state, state.immediate_index);
+            } else if (failed && state.autoplay && state.autoplay_advancing) {
+                size_t count = library_handler_track_count(library);
+                size_t nxt = count ? (state.immediate_index + 1) % count : state.immediate_index;
+                state.immediate_pending = 0;
+                state.autoplay_advancing = 1;
+                request_play(library, &state, nxt);
+            }
         }
 
         /* Prefetch the next track shortly before the current one ends. */
@@ -1285,15 +1657,57 @@ int main(int argc, char **argv) {
                     if (!already && !cached) {
                         state.pending_valid = 1;
                         state.pending_index = next;
+                        state.autoplay_advancing = 1;
                         start_fetch(library, &state, next);
                     }
                 }
             }
         }
 
+        /* Commit a prefetched or autoplay-next track as soon as its fetch is
+         * ready, once the current track has ended. Without this a slow source
+         * (HTTPS/network) that was still downloading when the track ended would
+         * finish later and never be committed, stalling autoplay. */
+        if (state.track_ended && state.pending_valid) {
+            size_t idx = state.pending_index;
+            fetch_lock(&state);
+            int pending_ready = state.fetch_ready && state.fetch_index == idx;
+            int pending_failed = !state.fetch_active && !state.fetch_ready;
+            fetch_unlock(&state);
+            if (pending_ready) {
+                commit_fetch(&state, idx);
+            } else if (pending_failed && state.autoplay && state.autoplay_advancing) {
+                size_t count = library_handler_track_count(library);
+                size_t nxt = count ? (idx + 1) % count : idx;
+                state.pending_valid = 0;
+                state.autoplay_advancing = 1;
+                request_play(library, &state, nxt);
+            }
+        }
+
         if (state.is_playing && ++pos_tick % 30 == 0) {
             Uint32 p = playback_ms(&state);
+            if (p > state.last_position_ms) {
+                state.position_stalls = 0;
+            } else if (state.audio_device && !state.track_ended && state.duration_ms > 0) {
+                state.position_stalls++;
+            }
+            state.last_position_ms = p;
             if (p != state.position_ms) { state.position_ms = p; write_status(&state); }
+            /* Self-heal a device that opened before the audio graph was ready.
+             * SDL_OpenAudioDevice can succeed yet never create a working output
+             * stream, so the queued PCM is never consumed and the position never
+             * advances (stays at 0). Reopen the device from the buffered samples
+             * so playback recovers without a manual restart. */
+            if (state.audio_device && !state.track_ended && state.duration_ms > 0 &&
+                state.position_stalls >= 8 &&
+                (Uint32)(SDL_GetTicks() - state.last_audio_retry_ms) >= 6000) {
+                state.last_audio_retry_ms = SDL_GetTicks();
+                state.position_stalls = 0;
+                state.last_position_ms = 0;
+                p = state.position_ms;
+                retry_audio_device(&state);
+            }
             if (!state.track_ended && state.duration_ms > 0 && p >= state.duration_ms - 250u) {
                 state.track_ended = 1;
                 state.position_ms = state.duration_ms;
@@ -1311,6 +1725,7 @@ int main(int argc, char **argv) {
                     size_t next = count ? (state.selected_track + 1) % count : state.selected_track;
                     state.pending_valid = 1;
                     state.pending_index = next;
+                    state.autoplay_advancing = 1;
                     start_fetch(library, &state, next);
                 } else {
                     state.is_playing = 0;
@@ -1322,7 +1737,17 @@ int main(int argc, char **argv) {
             SDL_Delay(16);
         } else {
             nk_input_begin(ctx);
-            while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) running = 0; nk_sdl_handle_event(&event); }
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_QUIT) { running = 0; }
+                else if (event.type == SDL_DROPFILE) {
+                    if (event.drop.file) {
+                        handle_dropped_file(library_path, &state, event.drop.file, &library, &ripper);
+                        SDL_free(event.drop.file);
+                    }
+                    continue;
+                }
+                nk_sdl_handle_event(&event);
+            }
             nk_input_end(ctx);
             {
                 int ww = 1160, wh = 720;
