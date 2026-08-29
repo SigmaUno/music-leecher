@@ -79,12 +79,28 @@ BarWidget {
     function clampPosition() {
         root.positionMs = root.currentPosition();
     }
+    function enc(s) {
+        var out = "", i, c, code, hex;
+        for (i = 0; i < s.length; i++) {
+            c = s.charAt(i);
+            code = s.charCodeAt(i);
+            if (c === "%" || c === "'" || code < 0x21 || code === 0x7f) {
+                hex = code.toString(16).toUpperCase();
+                if (hex.length === 1) hex = "0" + hex;
+                out += "%" + hex;
+            } else {
+                out += c;
+            }
+        }
+        return out;
+    }
     function sendControl(cmd) {
-        var safe = cmd.replace(/'/g, "'\\''");
         root.lastCommandId = (root.lastCommandId + 1) & 0x7fffffff;
         root.pendingCommandId = root.lastCommandId;
         root.commandAcked = false;
-        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + root.lastCommandId + " " + safe + "' > " + root.controlFile]);
+        /* Encode the payload so values (titles/artists/albums) can contain
+         * newlines or shell-special characters without corrupting the line. */
+        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + root.lastCommandId + " " + enc(cmd) + "' > " + root.controlFile]);
     }
     function seekTo(ms) {
         root.sendControl("seek " + Math.round(ms));

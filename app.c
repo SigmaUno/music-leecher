@@ -1469,6 +1469,24 @@ static void handle_remove_track(LibraryHandler **library, MusicRipper *ripper, c
     write_status(state);
 }
 
+/* Control lines are percent-encoded by the widget so that command values
+ * (titles/artists/albums) may contain newlines or other control characters
+ * without corrupting the single-line channel.  Decode %XX back to bytes. */
+static void control_decode(char *out, size_t out_size, const char *in) {
+    size_t o = 0;
+    while (*in && o + 1 < out_size) {
+        if (in[0] == '%' && isxdigit((unsigned char)in[1]) && isxdigit((unsigned char)in[2]) && o + 1 < out_size) {
+            int hi = isdigit((unsigned char)in[1]) ? in[1] - '0' : (tolower((unsigned char)in[1]) - 'a' + 10);
+            int lo = isdigit((unsigned char)in[2]) ? in[2] - '0' : (tolower((unsigned char)in[2]) - 'a' + 10);
+            out[o++] = (char)((hi << 4) | lo);
+            in += 3;
+        } else {
+            out[o++] = *in++;
+        }
+    }
+    out[o] = '\0';
+}
+
 static void handle_control(const char *command, LibraryHandler **library, MusicRipper *ripper,
                            Assembler *assembler, AppState *state, const char *library_path) {
     /* Commands arrive as one line, e.g.: "play_pause", "next", "previous",
@@ -1518,14 +1536,16 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
         {
             unsigned long id = 0;
             char *end = NULL;
-            char *cmd = line;
+            char decoded[512];
+            const char *cmd = line;
             if (isdigit((unsigned char)line[0])) {
                 id = strtoul(line, &end, 10);
                 if (end != line && *end == ' ') cmd = end + 1;
                 else id = 0;
             }
             if (id != 0) state->last_cmd_id = id;
-            handle_control(cmd, library, (MusicRipper *)ripper, assembler, state, library_path);
+            control_decode(decoded, sizeof(decoded), cmd);
+            handle_control(decoded, library, (MusicRipper *)ripper, assembler, state, library_path);
         }
     }
     fclose(file);
