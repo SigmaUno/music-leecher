@@ -271,10 +271,8 @@ BarWidget {
         }
 
         root.title = newTitle;
-        if (newArtist !== "")
-            root.artist = newArtist;
-        if (newAlbum !== "")
-            root.album = newAlbum;
+        root.artist = newArtist !== "" ? newArtist : "No Artist";
+        root.album = newAlbum !== "" ? newAlbum : "No Album";
         root.durationMs = newDur;
         root.playing = isPlayingNow;
         /* Command acknowledgment: when the backend echoes the id we sent with a
