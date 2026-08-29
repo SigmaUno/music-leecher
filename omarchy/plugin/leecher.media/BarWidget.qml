@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Shapes
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Ui
@@ -41,6 +42,10 @@ BarWidget {
     property bool closed: false
     property int selectedTrackIndex: -1
     property int pendingPlayIndex: -1
+    property string statusText: ""
+    property int lastCommandId: 0
+    property int pendingCommandId: -1
+    property bool commandAcked: true
     property var tracks: []
 
     property int actionsIndex: -1
@@ -76,7 +81,10 @@ BarWidget {
     }
     function sendControl(cmd) {
         var safe = cmd.replace(/'/g, "'\\''");
-        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + safe + "' > " + root.controlFile]);
+        root.lastCommandId = (root.lastCommandId + 1) & 0x7fffffff;
+        root.pendingCommandId = root.lastCommandId;
+        root.commandAcked = false;
+        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + root.lastCommandId + " " + safe + "' > " + root.controlFile]);
     }
     function seekTo(ms) {
         root.sendControl("seek " + Math.round(ms));
@@ -210,7 +218,18 @@ BarWidget {
             root.album = newAlbum;
         root.durationMs = newDur;
         root.playing = isPlayingNow;
-        root.autoplay = data.autoplay !== false;
+        /* Command acknowledgment: when the backend echoes the id we sent with a
+         * control write, a previously-issued command has been processed. Only
+         * then do we let the backend's autoplay value override an optimistic
+         * local toggle; otherwise the echo would wipe a not-yet-applied tweak. */
+        if (data.cmd_id !== undefined && data.cmd_id !== null &&
+            root.pendingCommandId >= 0 && Number(data.cmd_id) === root.pendingCommandId) {
+            root.commandAcked = true;
+            root.pendingCommandId = -1;
+        }
+        if (root.pendingCommandId < 0)
+            root.autoplay = data.autoplay !== false;
+        root.statusText = data.status ? String(data.status) : "";
         root.hasTrack = root.title !== "";
         root.coverSource = data.cover ? String(data.cover) : "";
         root.selectedTrackIndex = idx;
@@ -307,13 +326,17 @@ BarWidget {
             id: label
             anchors.verticalCenter: parent.verticalCenter
             visible: !root.effectiveHidden
-            text: root.hasTrack ? (root.title + (root.artist !== "" ? "  \u00b7  " + root.artist : "")) : "Nothing's playing"
+            text: root.hasTrack ? (root.title + (root.artist !== "" ? "  \u00b7  " + root.artist : "")) : (root.statusText !== "" ? root.statusText : "Nothing's playing")
             color: root.hasTrack ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.4)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.body
             font.italic: !root.hasTrack
             elide: Text.ElideRight
             width: Math.max(0, Math.min(Style.space(150), row.width - Style.space(24) - glyph.width - row.spacing - Style.space(18)))
+
+            ToolTip.visible: root.statusText !== "" && label.hovered
+            ToolTip.text: root.statusText
+            ToolTip.delay: 400
         }
     }
 

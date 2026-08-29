@@ -48,6 +48,7 @@ typedef struct {
     char status[256];
     SourceMethod method;
     size_t selected_track;
+    unsigned long last_cmd_id;
     SDL_AudioDeviceID audio_device;
     DecoderSource *decoder;
     Uint64 audio_queued_frame;
@@ -218,18 +219,21 @@ static void write_status(const AppState *state) {
      * file stays private even when the first write races with the unlink. */
     char *title = json_escape(state->title), *artist = json_escape(state->artist),
          *album = json_escape(state->album), *library = json_escape(state->library_path),
-         *cover = json_escape(state->cover_file[0] ? state->cover_file : NULL);
+         *cover = json_escape(state->cover_file[0] ? state->cover_file : NULL),
+         *status = json_escape(state->status);
     char tmp[4096];
     int n;
     n = snprintf(tmp, sizeof(tmp),
                  "{\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
-                 "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,\"cover\":\"%s\"}\n",
+                 "\"position_ms\":%u,\"duration_ms\":%u,\"is_playing\":%s,\"track_index\":%zu,\"library\":\"%s\",\"autoplay\":%s,\"cover\":\"%s\","
+                 "\"status\":\"%s\",\"cmd_id\":%lu}\n",
                  title ? title : "", artist ? artist : "", album ? album : "",
                  state->position_ms, state->duration_ms,
                  state->is_playing ? "true" : "false", state->selected_track,
                  library ? library : "", state->autoplay ? "true" : "false",
-                 cover ? cover : "");
-    free(title); free(artist); free(album); free(library); free(cover);
+                 cover ? cover : "",
+                 status ? status : "", state->last_cmd_id);
+    free(title); free(artist); free(album); free(library); free(cover); free(status);
     if (n < 0 || (size_t)n >= sizeof(tmp)) return; /* oversized; leave old status intact */
     atomic_write(status_file, tmp, (size_t)n);
 }
@@ -1508,7 +1512,21 @@ static void poll_control(LibraryHandler **library, const MusicRipper *ripper,
     if (!file) { close(fd); unlink(control_file); return; }
     if (fgets(line, sizeof(line), file)) {
         line[strcspn(line, "\r\n")] = '\0';
-        handle_control(line, library, (MusicRipper *)ripper, assembler, state, library_path);
+        /* Optional command acknowledgment: a numeric id followed by a space is
+         * a client-generated token echoed back as `cmd_id` in the status JSON
+         * so the widget can confirm its command was received and processed. */
+        {
+            unsigned long id = 0;
+            char *end = NULL;
+            char *cmd = line;
+            if (isdigit((unsigned char)line[0])) {
+                id = strtoul(line, &end, 10);
+                if (end != line && *end == ' ') cmd = end + 1;
+                else id = 0;
+            }
+            if (id != 0) state->last_cmd_id = id;
+            handle_control(cmd, library, (MusicRipper *)ripper, assembler, state, library_path);
+        }
     }
     fclose(file);
     unlink(control_file);
