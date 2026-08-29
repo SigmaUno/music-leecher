@@ -3,7 +3,7 @@
   "id": "leecher.media",
   "name": "Leecher Music",
   "version": "1.0.0",
-  "author": "You",
+  "author": "Sigma Uno",
   "description": "Now playing and transport controls for leecher-music-player",
   "kinds": [
     "bar-widget"
