@@ -87,6 +87,11 @@ BarWidget {
     }
     function clampPosition() {
         root.positionMs = root.currentPosition();
+        /* Drive the scrubber from position only when the user is not dragging,
+         * so the 500 ms timer never fights the handle under the finger.  The
+         * slider holds its own drag state (PanelSlider.dragging) while moving. */
+        if (!slider.dragging)
+            slider.value = root.positionMs;
     }
     function enc(s) {
         var out = "", i, c, code, hex;
@@ -186,8 +191,10 @@ BarWidget {
             return "0:00";
         var s = Math.floor(ms / 1000);
         var m = Math.floor(s / 60);
+        var h = Math.floor(m / 60);
         s = s % 60;
-        return m + ":" + (s < 10 ? "0" : "") + s;
+        m = m % 60;
+        return h + ":" + (m < 10 ? "0" : "") + ":" + (s < 10 ? "0" : "") + s;
     }
     function close() {
         root.popupOpen = false;
@@ -389,6 +396,7 @@ BarWidget {
 
     MouseArea {
         anchors.fill: parent
+        z: -1
         acceptedButtons: Qt.LeftButton | Qt.RightButton
         cursorShape: Qt.PointingHandCursor
         onClicked: function (mouse) {
@@ -511,7 +519,7 @@ BarWidget {
                 spacing: Style.space(8)
 
                 Text {
-                    text: root.fmt(root.positionMs)
+                    text: root.fmt(slider.dragging ? slider.liveValue : root.positionMs)
                     color: root.bar.foreground
                     font.family: root.bar.fontFamily
                     font.pixelSize: Style.font.caption
@@ -528,9 +536,10 @@ BarWidget {
                     minimum: 0
                     maximum: Math.max(1, root.durationMs)
                     step: 500
-                    value: root.positionMs
+                    value: 0
                     enabled: root.durationMs > 0
-                    onMoved: function (v) {
+                    onReleased: function (v) {
+                        slider.value = v;
                         root.seekTo(v);
                     }
                 }
@@ -708,6 +717,7 @@ BarWidget {
                             anchors.leftMargin: Style.space(8)
                             anchors.rightMargin: Style.space(8)
                             spacing: Style.space(8)
+                            z: 2
 
                             Text {
                                 width: Style.space(24)
@@ -753,6 +763,7 @@ BarWidget {
                                 }
                                 MouseArea {
                                     anchors.fill: parent
+                                    z: 2
                                     onClicked: {
                                         root.editVisible = false;
                                         root.actionsIndex = (root.actionsIndex === modelData.index) ? -1 : modelData.index;
@@ -763,7 +774,8 @@ BarWidget {
 
                         BorderSurface {
                             width: parent.width
-                            visible: root.actionsIndex >= 0 && !root.editVisible
+                            visible: root.actionsIndex === modelData.index && !root.editVisible
+                            z: 3
                             radius: Style.spacing.labelGap
                             color: "transparent"
                             borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
@@ -780,7 +792,7 @@ BarWidget {
                                     verticalPadding: 0
                                     horizontalPadding: Style.spacing.controlPaddingX
                                     tooltipText: "Play"
-                                    onClicked: root.playIndex(root.actionsIndex)
+                                    onClicked: root.playIndex(modelData.index)
                                 }
                                 Button {
                                     iconText: "\uf040"
@@ -790,7 +802,7 @@ BarWidget {
                                     verticalPadding: 0
                                     horizontalPadding: Style.spacing.controlPaddingX
                                     tooltipText: "Edit info"
-                                    onClicked: root.startEdit(root.actionsIndex)
+                                    onClicked: root.startEdit(modelData.index)
                                 }
                                 Button {
                                     iconText: "\uf2ed"
@@ -800,14 +812,15 @@ BarWidget {
                                     verticalPadding: 0
                                     horizontalPadding: Style.spacing.controlPaddingX
                                     tooltipText: "Remove"
-                                    onClicked: root.removeTrack(root.actionsIndex)
+                                    onClicked: root.removeTrack(modelData.index)
                                 }
                             }
                         }
 
                         BorderSurface {
                             width: parent.width
-                            visible: root.editVisible
+                            visible: root.editVisible && root.editIndex === modelData.index
+                            z: 4
                             radius: Style.spacing.labelGap
                             color: Style.selectedFillFor(root.bar.foreground, Color.accent)
                             borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
@@ -908,6 +921,7 @@ BarWidget {
 
                         MouseArea {
                             anchors.fill: parent
+                            z: 1
                             onClicked: root.playFromRow(modelData.index)
                         }
                     }
