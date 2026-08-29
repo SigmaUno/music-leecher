@@ -10,12 +10,17 @@ BarWidget {
     id: root
     moduleName: "leecher.media"
 
-    /* IPC directory shared with the backend.  These are shell fragments that
-     * the `sh -c` polls below expand at runtime, mirroring app.c's
-     * init_ipc_dir(): $XDG_RUNTIME_DIR/leecher, else /tmp/leecher-<uid>. */
-    readonly property string ipcDirShell: "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/leecher}${XDG_RUNTIME_DIR:-/tmp/leecher-$UID}"
-    readonly property string statusFile: ipcDirShell + "/status.json"
-    readonly property string controlFile: ipcDirShell + "/control"
+    /* IPC directory shared with the backend.  Resolved once to a literal path
+     * via Quickshell.env() (no shell fragment) so the file watchers below can
+     * watch it directly and no per-poll `sh -c cat` process is needed.  Mirrors
+     * app.c init_ipc_dir(): $XDG_RUNTIME_DIR/leecher, else /tmp/leecher-<uid>. */
+    readonly property string runtimeDir: (function () {
+        var rd = Quickshell.env("XDG_RUNTIME_DIR");
+        var uid = Quickshell.env("UID");
+        return (rd && rd !== "") ? (rd + "/leecher") : ("/tmp/leecher-" + uid);
+    })()
+    readonly property string statusFile: root.runtimeDir + "/status.json"
+    readonly property string controlFile: root.runtimeDir + "/control"
 
     property string title: ""
     property string artist: ""
@@ -99,8 +104,10 @@ BarWidget {
         root.pendingCommandId = root.lastCommandId;
         root.commandAcked = false;
         /* Encode the payload so values (titles/artists/albums) can contain
-         * newlines or shell-special characters without corrupting the line. */
-        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + root.lastCommandId + " " + enc(cmd) + "' > " + root.controlFile]);
+         * newlines or shell-special characters without corrupting the line, and
+         * quote the literal control path so a runtime dir with spaces still
+         * resolves to a single redirection target. */
+        Quickshell.execDetached(["sh", "-c", "printf '%s\\n' '" + root.lastCommandId + " " + enc(cmd) + "' > \"" + root.controlFile + "\""]);
     }
     function seekTo(ms) {
         root.sendControl("seek " + Math.round(ms));
@@ -177,8 +184,7 @@ BarWidget {
         root.pendingPlayIndex = -1;
     }
     function refresh() {
-        if (!statusProc.running)
-            statusProc.running = true;
+        statusFileView.reload();
     }
     function updateStatus(raw) {
         var data;
@@ -284,15 +290,6 @@ BarWidget {
     Component.onCompleted: refresh()
 
     Timer {
-        id: pollTimer
-        interval: 1000
-        running: true
-        repeat: true
-        triggeredOnStart: true
-        onTriggered: root.refresh()
-    }
-
-    Timer {
         id: posTimer
         interval: 500
         running: true
@@ -300,15 +297,17 @@ BarWidget {
         onTriggered: root.clampPosition()
     }
 
-    Process {
-        id: statusProc
-        /* Quote the status path so a $XDG_RUNTIME_DIR containing spaces or
-         * shell metacharacters cannot be split into extra argv words. */
-        command: ["sh", "-c", "cat \"" + root.statusFile + "\" 2>/dev/null"]
-        stdout: StdioCollector {
-            waitForEnd: true
-            onStreamFinished: root.updateStatus(text)
-        }
+    /* Watch status.json with an in-process file watcher instead of re-spawning
+     * `sh -c cat` every second.  `reload()`/`text()` read the file in-process,
+     * so no shell or forked reader is involved.  The backend rewrites the file
+     * atomically (mkstemp + rename); FileView re-watches the recreated path. */
+    FileView {
+        id: statusFileView
+        path: root.statusFile
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: root.updateStatus(text())
     }
 
     Row {
